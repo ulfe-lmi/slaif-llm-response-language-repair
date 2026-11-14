@@ -31,8 +31,8 @@
    "sha256": "a9ea5fa5db2affabf0f85710f41e37e73b108c0236a58b7efb9c17cb36a07e9e"
   },
   "INSTALL.md": {
-   "sha256": "edcc98505936eb8f796ab3f36adba4faa2039ea7263da71e036ffc579a6e7c00",
-   "bytes": 15699,
+   "sha256": "91826ca6647864b9f145d0a1808422650f0eb49ac958020f9461dfb83b4f2943",
+   "bytes": 16255,
    "class": "generated"
   },
   "LICENSE": {
@@ -51,14 +51,14 @@
    "sha256": "d2aa1d98cc5177ac6093ab3aeb79903b192780910ef2d1712839b474fb5adbf0"
   },
   "QUICKSTART.md": {
-   "sha256": "e10fe6ed0bd3418fdff664bb234277c604fc05a7126a0ff72d2e951ff14c031d",
-   "bytes": 3593,
+   "sha256": "09b183daac6b0b26124d3ac371d63adbc82b48f305260fcc9bd7391ec4b91147",
+   "bytes": 3690,
    "class": "generated"
   },
   "README.md": {
-   "bytes": 5156,
+   "bytes": 5754,
    "class": "generated",
-   "sha256": "8340e2326c3610ccbcf04d9dbf5dd6b1aeb1ed60d4f32ee2999d039b253eb6de"
+   "sha256": "58bf567702060e8c829fac7221470b9590f825f0cdaec3b383358e3ab2931546"
   },
   "SECURITY.md": {
    "bytes": 2266,
@@ -66,9 +66,9 @@
    "sha256": "1e3e9e59259ea6a57a3d8e368e896560c214f453c98792f7979e8d99b4154069"
   },
   "STATUS.md": {
-   "bytes": 4380,
+   "bytes": 4859,
    "class": "generated",
-   "sha256": "0ade81d349a60ce4298332b175d8299811717a64a55cc7a49672189e4e0b5d68"
+   "sha256": "fced967b46b1544a5dc0fe0cce0c9ea6fc857c7b082fcd7f02ba43bf3565db2c"
   },
   "TESTING.md": {
    "bytes": 2310,
@@ -126,8 +126,8 @@
    "sha256": "5da0d9f2086a8774f08b520c27d2e77fc0c3919904a6d41b9d7049ef205b4186"
   },
   "docs/README.md": {
-   "sha256": "9119ef505164e9b63ebe5551e4a5834721bfc98f222d3289fd032455843af91d",
-   "bytes": 3774,
+   "sha256": "eb84006f28f505d3923f472c10cc9ea45836a318623b48bd24340b8b400a50e6",
+   "bytes": 3930,
    "class": "generated"
   },
   "docs/WORKSPACE-PLACEMENT.md": {
@@ -889,6 +889,11 @@
    "class": "generated",
    "sha256": "11e4bad74af5ed544c46d0026aa64fa859bd7621cd64d2196f62adc04975a4b0",
    "bytes": 7522
+  },
+  "docs/PROXY-CHAINING.md": {
+   "class": "generated",
+   "sha256": "7dae1964532921d63a9edf3cd0ae4713eeb38fc554338fc1f62a03654958d159",
+   "bytes": 4686
   }
  },
  "purpose": "Scoped generated handoff inventory, not permanent runtime freeze",
