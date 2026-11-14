@@ -2122,6 +2122,7 @@ class ConstructorWiringTests(unittest.TestCase):
                 usage_observer: Callable[[dict[str, object]], None] | None = None,
                 *,
                 header_timeout: float = 30.0,
+                passthrough_mode: bool = False,
             ) -> None:
                 super().__init__(
                     ("127.0.0.1", 0),
@@ -2131,6 +2132,7 @@ class ConstructorWiringTests(unittest.TestCase):
                     trace_dir=trace_dir,
                     usage_observer=usage_observer,
                     header_timeout=header_timeout,
+                    passthrough_mode=passthrough_mode,
                 )
                 captured["port"] = self.server_address[1]
                 captured["proxy"] = self

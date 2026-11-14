@@ -31,8 +31,8 @@
    "sha256": "a9ea5fa5db2affabf0f85710f41e37e73b108c0236a58b7efb9c17cb36a07e9e"
   },
   "INSTALL.md": {
-   "sha256": "c3e390c05042e26053a0c5f89950afc5eac719277f690e57ff229d531adf9c73",
-   "bytes": 15727,
+   "sha256": "df7ced04d3743a33f43680f25cbe7742c430285f72274292f14b99f5a62ea8ee",
+   "bytes": 16283,
    "class": "generated"
   },
   "LICENSE": {
@@ -51,14 +51,14 @@
    "sha256": "d2aa1d98cc5177ac6093ab3aeb79903b192780910ef2d1712839b474fb5adbf0"
   },
   "QUICKSTART.md": {
-   "sha256": "e10fe6ed0bd3418fdff664bb234277c604fc05a7126a0ff72d2e951ff14c031d",
-   "bytes": 3593,
+   "sha256": "09b183daac6b0b26124d3ac371d63adbc82b48f305260fcc9bd7391ec4b91147",
+   "bytes": 3690,
    "class": "generated"
   },
   "README.md": {
-   "bytes": 5179,
+   "bytes": 5768,
    "class": "generated",
-   "sha256": "b4d599d0b2be0e399c448e61372d02b3ae87160c56f715dc5dc6cc1d57ad7342"
+   "sha256": "8f142cf469e408510bbe26b961baa27942ce6965ad3e00c99a23537b0989087e"
   },
   "SECURITY.md": {
    "bytes": 2266,
@@ -66,9 +66,9 @@
    "sha256": "1e3e9e59259ea6a57a3d8e368e896560c214f453c98792f7979e8d99b4154069"
   },
   "STATUS.md": {
-   "bytes": 4394,
+   "bytes": 4873,
    "class": "generated",
-   "sha256": "fee2962cd4f7a6707c332e10bbd4c8cfe87389e556539ed57c674502cf195b68"
+   "sha256": "850a4b7ba34df36761c149fb5d0692952bade09f72df106ded106b3186ba3886"
   },
   "TESTING.md": {
    "bytes": 2310,
@@ -126,8 +126,8 @@
    "sha256": "5da0d9f2086a8774f08b520c27d2e77fc0c3919904a6d41b9d7049ef205b4186"
   },
   "docs/README.md": {
-   "sha256": "9119ef505164e9b63ebe5551e4a5834721bfc98f222d3289fd032455843af91d",
-   "bytes": 3774,
+   "sha256": "eb84006f28f505d3923f472c10cc9ea45836a318623b48bd24340b8b400a50e6",
+   "bytes": 3930,
    "class": "generated"
   },
   "docs/WORKSPACE-PLACEMENT.md": {
@@ -889,6 +889,11 @@
    "class": "generated",
    "sha256": "11e4bad74af5ed544c46d0026aa64fa859bd7621cd64d2196f62adc04975a4b0",
    "bytes": 7522
+  },
+  "docs/PROXY-CHAINING.md": {
+   "class": "generated",
+   "sha256": "7dae1964532921d63a9edf3cd0ae4713eeb38fc554338fc1f62a03654958d159",
+   "bytes": 4686
   },
   "oap/tests/test_repository_rename.py": {
    "class": "generated",
