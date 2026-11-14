@@ -873,6 +873,7 @@ class ConstructorWiringTests(unittest.TestCase):
                     ] | None = None,
                     *,
                     header_timeout: float = MAIN_HEADER_TIMEOUT_SECONDS,
+                    passthrough_mode: bool = False,
                 ) -> None:
                     super().__init__(
                         ("127.0.0.1", 0),
@@ -882,6 +883,7 @@ class ConstructorWiringTests(unittest.TestCase):
                         trace_dir=trace_dir,
                         usage_observer=usage_observer,
                         header_timeout=header_timeout,
+                        passthrough_mode=passthrough_mode,
                     )
                     seen["timeout"] = self.capture_timeout
                     seen["header_timeout"] = self.header_timeout

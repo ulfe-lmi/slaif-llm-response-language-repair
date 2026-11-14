@@ -2670,6 +2670,7 @@ class DeliveryMainWiringTests(unittest.TestCase):
                     header_timeout: float = MAIN_HEADER_TIMEOUT_SECONDS,
                     client_timeout: float = CLIENT_REQUEST_TIMEOUT_SECONDS,
                     delivery_timeout: float = CLIENT_DELIVERY_TIMEOUT_SECONDS,
+                    passthrough_mode: bool = False,
                 ) -> None:
                     super().__init__(
                         ("127.0.0.1", 0),
@@ -2681,6 +2682,7 @@ class DeliveryMainWiringTests(unittest.TestCase):
                         header_timeout=header_timeout,
                         client_timeout=client_timeout,
                         delivery_timeout=delivery_timeout,
+                        passthrough_mode=passthrough_mode,
                     )
                     seen["delivery_timeout"] = self.delivery_timeout
                     created.append(self)
@@ -2706,6 +2708,7 @@ class DeliveryMainWiringTests(unittest.TestCase):
                     *,
                     header_timeout: float = MAIN_HEADER_TIMEOUT_SECONDS,
                     client_timeout: float = CLIENT_REQUEST_TIMEOUT_SECONDS,
+                    passthrough_mode: bool = False,
                 ) -> None:
                     super().__init__(
                         ("127.0.0.1", 0),
@@ -2716,6 +2719,7 @@ class DeliveryMainWiringTests(unittest.TestCase):
                         usage_observer=usage_observer,
                         header_timeout=header_timeout,
                         client_timeout=client_timeout,
+                        passthrough_mode=passthrough_mode,
                     )
                     seen["delivery_timeout"] = self.delivery_timeout
                     created.append(self)
