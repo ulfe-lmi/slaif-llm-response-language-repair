@@ -75,13 +75,15 @@ model.
   connections. See [proxy chaining](docs/PROXY-CHAINING.md) for the
   `18023 → 18021` configuration and streaming behavior.
 - **No repair probabilities** — defined Responses API `logprobs` metadata is
-  removed on the eligible repair path, even when no correction is made.
+  removed from every recognized Responses body, eligible or not, even when no
+  correction is made.
 - **Exact, conservative edits** — only approved original-coordinate spans change;
   protected material, formatting and every other code point are preserved.
 - **Fail-closed** — a missing or incompatible index, or a technical failure
   of the optional repair after safe completion, returns the completed original;
-  truncated transport remains a transport failure. Ineligible envelopes and
-  upstream errors pass through without repair or metadata normalization.
+  truncated transport remains a transport failure. Ineligible or error
+  envelopes keep their status and error semantics, with defined logprobs
+  removed where recognized; malformed bodies pass through byte-identical.
 - **Mandatory pinned Pandoc 3.7.0.2** for structural original-span protection.
 - **External statistics** — real unigram/bigram/trigram counts (CC BY-SA 4.0) are
   not bundled in the repository; the installation fetches them into an external

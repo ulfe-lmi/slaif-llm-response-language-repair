@@ -53,7 +53,7 @@ mode remains loopback-only.
 - Client authorization and other end-to-end request headers; upstream status,
   body and end-to-end response headers, including repeated headers and errors.
 - Tool-call, structured, stored, background, incomplete and otherwise ineligible
-  responses without repair or metadata normalization.
+  responses without repair, with defined logprobs removed where recognized.
 
 HTTP framing is reconstructed for each hop. Host, connection headers and headers
 named by `Connection` are not forwarded. Chunked uploads are decoded and sent
@@ -71,9 +71,11 @@ envelope and SSE ownership rules. Function arguments, reasoning and tool results
 are never repair targets. A final text answer may therefore be repaired even
 when its request declared tools.
 
-Eligible JSON/SSE responses are buffered before inspection and repair. SSE on
-this path is delayed until completion. Other traffic streams through as bytes
-arrive. If a candidate response exceeds the 8 MB repair-capture limit, its
+Eligible JSON responses are buffered before inspection and repair. Eligible SSE
+forwards proven initial reasoning as frames complete and buffers from the first
+unproven frame on; the answer itself is never forwarded early (ARCHITECTURE
+section 5.3). Other traffic streams through as bytes arrive. If a candidate
+response exceeds the 8 MB repair-capture limit, its
 buffered prefix and remaining bytes pass through without repair. Compressed
 responses pass through without decompression or repair.
 

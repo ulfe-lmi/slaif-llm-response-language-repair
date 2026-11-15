@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -40,13 +41,23 @@ class Upstream(BaseHTTPRequestHandler):
     content_type = "application/octet-stream"
     recorded: list[tuple[str, str, bytes, list[tuple[str, str]]]] = []
     stream_gate = None
+    # Test-fake sync (fixture only): set immediately AFTER the
+    # pre-gate slice is written + flushed and BEFORE the handler
+    # waits on stream_gate, so tests can prove the upstream already
+    # delivered that slice while still holding the continuation.
+    chunk_written = None
+    content_length_override = None
+    chunk_split = None
 
     def relay(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         type(self).recorded.append((self.command, self.path, body, list(self.headers.items())))
         self.send_response(self.status)
         self.send_header("Content-Type", self.content_type)
-        self.send_header("Content-Length", str(len(self.source)))
+        self.send_header(
+            "Content-Length",
+            str(self.content_length_override or len(self.source)),
+        )
         self.send_header("X-Upstream", "preserved")
         self.send_header("ETag", '"original"')
         self.send_header("Set-Cookie", "one=1")
@@ -56,10 +67,17 @@ class Upstream(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             if self.stream_gate is not None:
-                self.wfile.write(self.source[:5])
+                split = (
+                    self.chunk_split
+                    if self.chunk_split is not None
+                    else 5
+                )
+                self.wfile.write(self.source[:split])
                 self.wfile.flush()
+                if type(self).chunk_written is not None:
+                    type(self).chunk_written.set()
                 self.stream_gate.wait(5)
-                self.wfile.write(self.source[5:])
+                self.wfile.write(self.source[split:])
             else:
                 self.wfile.write(self.source)
 
@@ -77,6 +95,9 @@ class PassthroughTests(unittest.TestCase):
         Upstream.content_type = "application/octet-stream"
         Upstream.recorded = []
         Upstream.stream_gate = None
+        Upstream.chunk_written = None
+        Upstream.content_length_override = None
+        Upstream.chunk_split = None
         _FakeUpstream.recorded = []
         _FakeUpstream.status = 200
         _FakeUpstream.delay = 0.0
@@ -373,6 +394,493 @@ class PassthroughTests(unittest.TestCase):
         self.assertEqual(Upstream.recorded, [])
 
 
+class R6LogprobsEdgeCaseTests(PassthroughTests):
+    """Order 038-a R6: the owner's unconditional defined-logprobs policy
+    on recognized Responses JSON/SSE beyond completed 200 (inherited
+    PR43 gap closed in the same order)."""
+
+    @staticmethod
+    def _incomplete_envelope_json():
+        return json.dumps({
+            "object": "response",
+            "status": "incomplete",
+            "error": None,
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Pozdrav.",
+                            "logprobs": [{"token": "Pozdrav.", "logprob": -0.25}],
+                        }
+                    ],
+                }
+            ],
+        }).encode()
+
+    @staticmethod
+    def _sse_frame(value: dict) -> bytes:
+        """One LF-delimited SSE data frame, compact JSON (the same
+        rendering the proxy uses when a frame is re-emitted)."""
+        return (
+            b"data: "
+            + json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            + b"\n\n"
+        )
+
+    @classmethod
+    def _incomplete_sse_bytes(cls) -> bytes:
+        return (
+            cls._sse_frame({
+                "type": "response.reasoning_part.added",
+                "part": {"type": "reasoning_text", "text": "mislim"},
+            })
+            + cls._sse_frame({
+                "type": "response.output_text.delta",
+                "delta": "Pozdrav.",
+                "logprobs": [{"token": "Pozdrav.", "logprob": -0.25}],
+            })
+            + cls._sse_frame({
+                "type": "response.incomplete",
+                "response": {
+                    "object": "response",
+                    "status": "incomplete",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_1",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Pozdrav.",
+                            "logprobs": [{"token": "Pozdrav.", "logprob": -0.25}],
+                        }],
+                    }],
+                },
+            })
+            + b"data: [DONE]\n\n"
+        )
+
+    def test_non200_incomplete_json_defined_logprobs_removed(self):
+        Upstream.status = 400
+        Upstream.content_type = "application/json"
+        Upstream.source = self._incomplete_envelope_json()
+        status, body, headers = self.request(body=b"invalid JSON")
+        self.assertEqual(status, 400)
+        envelope = json.loads(body)
+        self.assertEqual(envelope["status"], "incomplete")
+        self.assertEqual(envelope["incomplete_details"], {"reason": "max_output_tokens"})
+        self.assertEqual(envelope["error"], None)
+        self.assertEqual(envelope["output"][0]["content"][0]["text"], "Pozdrav.")
+        self.assertNotIn("logprobs", envelope["output"][0]["content"][0])
+        self.assertNotIn("ETag", dict(headers))
+        self.assert_no_review()
+
+    def test_non200_malformed_json_unchanged(self):
+        Upstream.status = 500
+        Upstream.content_type = "application/json"
+        Upstream.source = b'{"error": "boom", "output": [bad'
+        status, body, headers = self.request(body=b"invalid JSON")
+        self.assertEqual((status, body), (500, Upstream.source))
+        self.assertIn("ETag", dict(headers))
+        self.assert_no_review()
+
+    def test_non200_truncated_body_is_observable_failure(self):
+        Upstream.status = 400
+        Upstream.content_type = "application/json"
+        Upstream.source = b'{"e'
+        Upstream.content_length_override = 1024
+        status, body, _headers = self.request(body=b"invalid JSON")
+        self.assertEqual(status, 502)
+        self.assertEqual(
+            json.loads(body),
+            {"error": {"type": "upstream_error", "code": "UPSTREAM_FAILED"}},
+        )
+        self.assert_no_review()
+
+    def test_non200_oversize_falls_back_to_raw(self):
+        Upstream.status = 400
+        Upstream.content_type = "application/json"
+        Upstream.source = b'{"error": "x", "payload": "' + b"A" * 64 + b'"}'
+        with mock.patch.object(proxy, "MAIN_BODY_MAX_BYTES", 16):
+            status, body, headers = self.request(body=b"invalid JSON")
+        self.assertEqual((status, body), (400, Upstream.source))
+        self.assertIn("ETag", dict(headers))
+        self.assert_no_review()
+
+    def test_200_incomplete_json_defined_logprobs_removed(self):
+        Upstream.content_type = "application/json"
+        Upstream.source = self._incomplete_envelope_json()
+        status, body, _headers = self.request(body=self.candidate())
+        self.assertEqual(status, 200)
+        envelope = json.loads(body)
+        self.assertEqual(envelope["status"], "incomplete")
+        self.assertEqual(envelope["output"][0]["content"][0]["text"], "Pozdrav.")
+        self.assertNotIn("logprobs", envelope["output"][0]["content"][0])
+        self.assert_no_review()
+
+    def test_200_bypass_json_defined_logprobs_removed_without_repair(self):
+        Upstream.content_type = "application/json"
+        envelope = {
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": TEXT,
+                            "logprobs": [{"token": "Poz", "logprob": -0.1}],
+                        }
+                    ],
+                }
+            ],
+        }
+        Upstream.source = json.dumps(envelope).encode()
+        # structured output makes the request non-repair-eligible
+        status, body, _headers = self.request(
+            body=self.candidate(response_format={"type": "json_object"})
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["output"][0]["content"][0]["text"], TEXT)
+        self.assertNotIn("logprobs", result["output"][0]["content"][0])
+        self.assert_no_review()
+
+    def test_200_incomplete_sse_after_prefix_tail_logprobs_removed(self):
+        Upstream.content_type = "text/event-stream"
+        Upstream.source = self._incomplete_sse_bytes()
+        status, body, _headers = self.request(body=self.candidate(stream=True))
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"logprobs", body)
+        self.assertTrue(body.startswith(
+            b'data: {"type":"response.reasoning_part.added","part":{"type":"reasoning_text","text":"mislim"}}\n\n'
+        ))
+        self.assertLess(
+            body.index(b"mislim"), body.index(b'"delta":"Pozdrav."')
+        )
+        self.assertIn(b'"delta":"Pozdrav."', body)
+        self.assertIn(b"response.incomplete", body)
+        self.assert_no_review()
+
+    def test_sse_bypass_200_defined_logprobs_removed_incrementally(self):
+        Upstream.content_type = "text/event-stream"
+        Upstream.source = self._incomplete_sse_bytes()
+        status, body, _headers = self.request(
+            body=self.candidate(stream=True, store=True)
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"logprobs", body)
+        self.assertIn(b'"type":"response.reasoning_part.added"', body)
+        self.assertIn(b'"delta":"Pozdrav."', body)
+        self.assertIn(b"response.incomplete", body)
+        self.assertTrue(body.endswith(b"data: [DONE]\n\n"))
+        self.assert_no_review()
+
+    def test_sse_bypass_non200_defined_logprobs_removed_incrementally(self):
+        Upstream.status = 400
+        Upstream.content_type = "text/event-stream"
+        Upstream.source = (
+            self._sse_frame({
+                "type": "response.output_text.delta",
+                "delta": "Pozdrav.",
+                "logprobs": [{"token": "Pozdrav.", "logprob": -0.25}],
+            })
+            + self._sse_frame({
+                "type": "response.incomplete",
+                "response": {
+                    "object": "response",
+                    "status": "incomplete",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_1",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Pozdrav.",
+                            "logprobs": [{"token": "Pozdrav.", "logprob": -0.25}],
+                        }],
+                    }],
+                },
+            })
+            + b"data: [DONE]\n\n"
+        )
+        status, body, _headers = self.request(body=b"invalid JSON")
+        self.assertEqual(status, 400)
+        self.assertNotIn(b"logprobs", body)
+        self.assertIn(b'"delta":"Pozdrav."', body)
+        self.assert_no_review()
+
+    def test_sse_bypass_malformed_frame_switches_to_raw(self):
+        Upstream.content_type = "text/event-stream"
+        Upstream.source = (
+            self._sse_frame({
+                "type": "response.output_text.delta",
+                "delta": "Pozdrav.",
+                "logprobs": [{"token": "Pozdrav.", "logprob": -0.25}],
+            })
+            + b"data: {\"type\": broken\n\n"
+            + self._sse_frame({
+                "type": "response.output_text.delta",
+                "delta": "drugo",
+                "logprobs": [{"token": "drugo", "logprob": -0.3}],
+            })
+        )
+        status, body, _headers = self.request(
+            body=self.candidate(stream=True, store=True)
+        )
+        self.assertEqual(status, 200)
+        # first frame filtered; malformed frame verbatim; everything
+        # after the malformed frame verbatim (one-way raw fallback)
+        self.assertNotIn(b'"delta":"Pozdrav.","logprobs"', body)
+        self.assertIn(b'data: {"type": broken\n\n', body)
+        self.assertIn(b'"delta":"drugo","logprobs"', body)
+        self.assert_no_review()
+
+    def test_sse_other_path_stays_verbatim(self):
+        Upstream.content_type = "text/event-stream"
+        Upstream.source = self._sse_frame({
+            "type": "response.output_text.delta",
+            "delta": "Pozdrav.",
+            "logprobs": [{"token": "Pozdrav.", "logprob": -0.25}],
+        })
+        status, body, _headers = self.request(
+            method="POST",
+            path="/v1/chat/completions",
+            body=self.candidate(stream=True),
+        )
+        self.assertEqual((status, body), (200, Upstream.source))
+        self.assert_no_review()
+
+    def test_sse_bypass_split_utf8_across_chunks_byte_identical(self):
+        # A two-byte code point is cut in half across two wire
+        # chunks.  Only complete delimiter frames are ever decoded, so
+        # the answer text must arrive byte-identical, and the first
+        # complete frame must be delivered while the second chunk is
+        # still held back (per-frame filter, no whole-body buffering).
+        gate = threading.Event()
+        frame1 = self._sse_frame({
+            "type": "response.reasoning_part.added",
+            "part": {"type": "reasoning_text", "text": "razmišljam"},
+        })
+        frame2 = self._sse_frame({
+            "type": "response.output_text.delta",
+            "delta": "Dobro jutro, človek!",
+            "logprobs": [{"token": "človek!", "logprob": -0.4}],
+        })
+        frame3 = b"data: [DONE]\n\n"
+        source = frame1 + frame2 + frame3
+        # Cut the wire exactly inside the two-byte č code point of the
+        # delta: the first chunk ends with the lone lead byte 0xC4,
+        # the second chunk begins with the continuation byte.
+        split = len(frame1) + frame2.index("č".encode("utf-8")) + 1
+        Upstream.stream_gate = gate
+        Upstream.chunk_split = split
+        Upstream.content_type = "text/event-stream"
+        Upstream.source = source
+        result: dict = {}
+
+        def client() -> None:
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", self.proxy.server_port, timeout=10
+            )
+            conn.request(
+                "POST", "/v1/responses",
+                body=self.candidate(stream=True, store=True),
+            )
+            response = conn.getresponse()
+            first = response.read(len(frame1))
+            result["first"] = first
+            result["status"] = response.status
+            result["body"] = first + response.read()
+            conn.close()
+
+        thread = threading.Thread(target=client)
+        thread.start()
+        deadline = time.monotonic() + 5
+        while "first" not in result:
+            if time.monotonic() >= deadline:
+                gate.set()
+                thread.join(5)
+                self.fail(
+                    "first frame not delivered before the second wire chunk"
+                )
+            time.sleep(0.01)
+        # Upstream is still blocked on the gate: the first frame was
+        # delivered from the first chunk alone.
+        self.assertFalse(gate.is_set())
+        self.assertEqual(result["first"], frame1)
+        gate.set()
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["status"], 200)
+        rendered = self._sse_frame({
+            "type": "response.output_text.delta",
+            "delta": "Dobro jutro, človek!",
+        })
+        body = result["body"]
+        self.assertEqual(body, frame1 + rendered + frame3)
+        self.assertIn("človek!", body.decode("utf-8"))
+        self.assert_no_review()
+
+    def test_sse_bypass_malformed_then_partial_next_frame_preserves_order(self):
+        # The malformed frame latches the one-way raw fallback: the
+        # untouched tail of the first chunk (here cut inside a
+        # two-byte code point) must flush exactly once, in original
+        # byte order, ahead of every later chunk byte - and the
+        # client must have received all of it while the upstream
+        # still held its continuation on the gate.
+        gate = threading.Event()
+        frame1 = self._sse_frame({
+            "type": "response.output_text.delta",
+            "delta": "Pozdrav.",
+            "logprobs": [{"token": "Pozdrav.", "logprob": -0.25}],
+        })
+        frame2 = b"data: {\"type\": broken\n\n"
+        frame3 = self._sse_frame({
+            "type": "response.output_text.delta",
+            "delta": "šest",
+            "logprobs": [{"token": "šest", "logprob": -0.3}],
+        })
+        source = frame1 + frame2 + frame3
+        # First chunk ends inside frame3, inside the two-byte š code
+        # point (the lead byte 0xC5 sits alone in the first chunk).
+        split = len(frame1) + len(frame2) + frame3.index("š".encode("utf-8")) + 1
+        Upstream.stream_gate = gate
+        Upstream.chunk_split = split
+        Upstream.content_type = "text/event-stream"
+        Upstream.source = source
+        result: dict = {}
+
+        def client() -> None:
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", self.proxy.server_port, timeout=10
+            )
+            conn.request(
+                "POST", "/v1/responses",
+                body=self.candidate(stream=True, store=True),
+            )
+            response = conn.getresponse()
+            result["status"] = response.status
+            while True:
+                chunk = response.read1(65536)
+                if not chunk:
+                    break
+                result["progress"] = result.get("progress", b"") + chunk
+            conn.close()
+            result["body"] = result.get("progress", b"")
+
+        thread = threading.Thread(target=client, daemon=True)
+        thread.start()
+        rendered1 = self._sse_frame({
+            "type": "response.output_text.delta",
+            "delta": "Pozdrav.",
+        })
+        expected_partial = rendered1 + frame2 + frame3[
+            : split - len(frame1) - len(frame2)
+        ]
+        try:
+            # Receipt timeout comfortably below the gate's 5 s
+            # auto-release so the continuation can only be missing
+            # because it is still held.
+            deadline = time.monotonic() + 3
+            while result.get("progress", b"") != expected_partial:
+                if time.monotonic() >= deadline:
+                    self.fail(
+                        "first-chunk bytes not delivered while the "
+                        "upstream was still blocked"
+                    )
+                time.sleep(0.01)
+            # Upstream is still blocked on the gate: everything the
+            # client holds so far came from the first chunk alone.
+            self.assertFalse(gate.is_set())
+            gate.set()
+        finally:
+            gate.set()
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["status"], 200)
+        body = result["body"]
+        # First frame filtered; malformed frame and everything after
+        # it verbatim, original byte order preserved.
+        self.assertEqual(body, rendered1 + frame2 + frame3)
+        self.assert_no_review()
+
+    def test_sse_bypass_no_delimiter_falls_back_verbatim_at_bound(self):
+        # Delimiter-free growth is bounded: the retained tail flushes
+        # verbatim once past MAIN_BODY_MAX_BYTES while the upstream
+        # still holds its continuation - not at EOF - and the
+        # remainder is relayed raw, byte-identical, with zero review.
+        gate = threading.Event()
+        Upstream.content_type = "text/event-stream"
+        source = (
+            b'data: {"type":"response.output_text.delta","delta":"'
+            b"Zadnja besedica precej dljsa od male meje brez meje"
+            b'","logprobs":[{"token":"x","logprob":-0.1}]}'
+        )
+        # A delimiter-free first chunk, already past the mocked bound.
+        split = 40
+        Upstream.stream_gate = gate
+        Upstream.chunk_split = split
+        Upstream.source = source
+        result: dict = {}
+
+        def client() -> None:
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", self.proxy.server_port, timeout=10
+            )
+            conn.request(
+                "POST", "/v1/responses",
+                body=self.candidate(stream=True, store=True),
+            )
+            response = conn.getresponse()
+            result["status"] = response.status
+            while True:
+                chunk = response.read1(65536)
+                if not chunk:
+                    break
+                result["progress"] = result.get("progress", b"") + chunk
+            conn.close()
+            result["body"] = result.get("progress", b"")
+
+        thread = threading.Thread(target=client, daemon=True)
+        with mock.patch.object(proxy, "MAIN_BODY_MAX_BYTES", 16):
+            thread.start()
+            try:
+                # Receipt timeout comfortably below the gate's 5 s
+                # auto-release: the flushed bytes can only be on the
+                # wire because the bound fired, not because the
+                # upstream finished.
+                deadline = time.monotonic() + 3
+                while result.get("progress", b"") != source[:split]:
+                    if time.monotonic() >= deadline:
+                        self.fail(
+                            "bounded verbatim fallback not delivered "
+                            "before upstream release"
+                        )
+                    time.sleep(0.01)
+                self.assertFalse(gate.is_set())
+                gate.set()
+            finally:
+                gate.set()
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result["status"], 200)
+            self.assertEqual(result["body"], source)
+        self.assert_no_review()
+
+
 class LauncherSettingsTests(unittest.TestCase):
     def run_launcher(self, settings):
         environment = {"CONCEPT_INDEX": "/synthetic/index.sqlite", **settings}
@@ -417,6 +925,202 @@ class LauncherSettingsTests(unittest.TestCase):
                 ):
                     proxy.main()
                 factory.assert_not_called()
+
+
+class R1BarrierRegressionTests(PassthroughTests):
+    """Order 038-a R1: primary-authored real-HTTP barrier regressions
+    (reusing the fixture, repair-eligible route store=False): a
+    contradictory lifecycle snapshot and an embedded response carrier
+    must each latch the one-way boundary.  Safe first-frame early
+    receipt is proven against the gated upstream, nothing forbidden
+    reaches the client while the gate is held, and the final
+    original order/text is delivered exactly once (clean answer:
+    zero review, byte-identical).  Both streams end at ``[DONE]``
+    with no valid completed envelope: a legitimate incomplete/
+    unsupported-tail shape (the eligible transparent path ends its
+    bounded read1 loop at the declared Content-Length, finds no
+    valid completion, and normalizes/delivers the retained tail with
+    zero review); the completed repair path is proven separately by
+    the existing integrated suite."""
+
+    @staticmethod
+    def _sse_frame(value: dict) -> bytes:
+        """One LF-delimited SSE data frame, compact JSON (the same
+        rendering the proxy uses when a frame is re-emitted)."""
+        return (
+            b"data: "
+            + json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            + b"\n\n"
+        )
+
+    def _run_gated_sse(self, frames: list[bytes], split: int) -> dict:
+        gate = threading.Event()
+        written = threading.Event()
+        Upstream.stream_gate = gate
+        Upstream.chunk_written = written
+        Upstream.chunk_split = split
+        Upstream.content_type = "text/event-stream"
+        Upstream.source = b"".join(frames)
+        result: dict = {}
+
+        def client() -> None:
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", self.proxy.server_port, timeout=10
+            )
+            # Repair-eligible route (store=False): the prefix
+            # classifier gates early delivery and the final answer
+            # goes through the review path.
+            conn.request(
+                "POST", "/v1/responses",
+                body=self.candidate(stream=True),
+            )
+            response = conn.getresponse()
+            result["status"] = response.status
+            progress = b""
+            while True:
+                chunk = response.read1(65536)
+                if not chunk:
+                    break
+                progress += chunk
+                result["progress"] = progress
+            conn.close()
+            result["body"] = progress
+
+        thread = threading.Thread(target=client, daemon=True)
+        thread.start()
+        return {"gate": gate, "written": written, "thread": thread, "result": result}
+
+    def _wait_for_prefix(self, run: dict, safe: bytes) -> None:
+        # Safe first-frame receipt while the upstream gate is held;
+        # startswith (not equality) so a single read carrying
+        # safe+forbidden bytes is caught by the exact held-prefix
+        # assertion, not reported as a missing safe frame.
+        deadline = time.monotonic() + 3
+        while not run["result"].get("progress", b"").startswith(safe):
+            if time.monotonic() >= deadline:
+                self.fail(
+                    "safe first frame not delivered early while the "
+                    "upstream gate was held"
+                )
+            time.sleep(0.01)
+
+    def _wait_held_window(self, run: dict, expected_held: bytes, seconds: float = 0.8) -> None:
+        # Exact held prefix for a short window before release: the
+        # client's held bytes must stay exactly ``expected_held``
+        # while the upstream still holds its continuation on the gate.
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            held = run["result"].get("progress", b"")
+            if held != expected_held:
+                self.fail(
+                    "forbidden early bytes or wrong held prefix "
+                    f"before release: {held[:160]!r} != {expected_held[:160]!r}"
+                )
+            time.sleep(0.02)
+        self.assertFalse(run["gate"].is_set())
+
+    def test_r1_contradictory_lifecycle_snapshot_one_way_boundary(self):
+        # Safe framing (an SSE comment) is delivered early first; the
+        # contradictory lifecycle snapshot behind it (PRESENT terminal
+        # status, empty output) is NOT a validated nonterminal prefix,
+        # and neither is the safe reasoning frame behind THAT in the
+        # same pre-gate slice: while the gate is held the client holds
+        # ONLY the comment.  After release the whole stream arrives
+        # once, in original order, the clean answer untouched
+        # (zero review).
+        comment = b": framing\n\n"
+        frame1 = self._sse_frame({
+            "type": "response.created",
+            "response": {"object": "response", "status": "completed", "output": []},
+        })
+        frame2 = self._sse_frame({
+            "type": "response.reasoning_part.added",
+            "part": {"type": "reasoning_text", "text": "mislim"},
+        })
+        frame3 = self._sse_frame(
+            {"type": "response.output_text.delta", "delta": _CLEAN_ANSWER})
+        frame4 = b"data: [DONE]\n\n"
+        run = self._run_gated_sse(
+            [comment, frame1, frame2, frame3, frame4],
+            split=len(comment) + len(frame1) + len(frame2),
+        )
+        try:
+            run["written"].wait(5)
+            self.assertTrue(run["written"].is_set())
+            # Upstream already delivered the whole pre-gate slice and
+            # holds the rest: prove the safe framing frame was
+            # received early...
+            self._wait_for_prefix(run, comment)
+            # ...and the exact held prefix is ONLY that safe frame:
+            # no contradictory snapshot, no later reasoning, no
+            # answer/terminal/review bytes.
+            self._wait_held_window(run, comment)
+            run["gate"].set()
+            run["thread"].join(10)
+            self.assertFalse(run["thread"].is_alive())
+            self.assertEqual(run["result"]["status"], 200)
+            # Final original order/text exactly once, no replay.
+            self.assertEqual(
+                run["result"]["body"],
+                comment + frame1 + frame2 + frame3 + frame4,
+            )
+            self.assert_no_review()
+        finally:
+            run["gate"].set()
+            run["thread"].join(5)
+
+    def test_r1_embedded_response_carrier_boundary_after_safe_prefix(self):
+        # The safe first frame (a proven reasoning part) is delivered
+        # early; the following reasoning delta embeds a response
+        # carrier with a PRESENT terminal status and empty output,
+        # and the next frame is a later safe reasoning delta - all
+        # three in the pre-gate slice.  The embedded carrier latches
+        # the one-way boundary: while the gate is held the client
+        # holds ONLY the safe first frame (no contradictory carrier,
+        # no later reasoning, no answer, no terminal, no review);
+        # after release the retained tail and remainder arrive once,
+        # original order, without replaying the sent prefix.
+        frame1 = self._sse_frame({
+            "type": "response.reasoning_part.added",
+            "part": {"type": "reasoning_text", "text": "mislim"},
+        })
+        frame2 = self._sse_frame({
+            "type": "response.reasoning_text.delta",
+            "item_id": "rs_1",
+            "delta": "razmišljam",
+            "response": {"object": "response", "status": "completed", "output": []},
+        })
+        frame3 = self._sse_frame({
+            "type": "response.reasoning_text.delta",
+            "item_id": "rs_1",
+            "delta": "dokončujem",
+        })
+        frame4 = self._sse_frame(
+            {"type": "response.output_text.delta", "delta": _CLEAN_ANSWER})
+        frame5 = b"data: [DONE]\n\n"
+        run = self._run_gated_sse(
+            [frame1, frame2, frame3, frame4, frame5],
+            split=len(frame1) + len(frame2) + len(frame3),
+        )
+        try:
+            run["written"].wait(5)
+            self.assertTrue(run["written"].is_set())
+            self._wait_for_prefix(run, frame1)
+            self._wait_held_window(run, frame1)
+            run["gate"].set()
+            run["thread"].join(10)
+            self.assertFalse(run["thread"].is_alive())
+            self.assertEqual(run["result"]["status"], 200)
+            # Final original order/text exactly once, no replay of the
+            # sent prefix.
+            self.assertEqual(
+                run["result"]["body"],
+                frame1 + frame2 + frame3 + frame4 + frame5,
+            )
+            self.assert_no_review()
+        finally:
+            run["gate"].set()
+            run["thread"].join(5)
 
 
 if __name__ == "__main__":

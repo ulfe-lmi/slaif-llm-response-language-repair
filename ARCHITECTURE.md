@@ -1,21 +1,25 @@
-# SLAIF Slovenian Repair — Architecture
+# SLAIF LLM Response Language Repair — Architecture
 
 | | |
 | --- | --- |
-| Revision | 2.0, 2026-11-12 — current runnable architecture |
-| Prior revision | 1.1, SHA-256 `a16e0f87bdb21f6920aa63119cf5be148b6c8b68bf1337c44006d54b7a7261f7` |
-| Authorized base | `987fdb9ed07856d735f1e684f8af342461bf5236` |
+| Revision | 2.1, 2026-11-15 — current runnable architecture |
+| Prior revision | 2.0, SHA-256 `4df1664cec86aae1e3e07e19f61650919fa8dc5011acc67f411848eeee0a8ed9` |
+| Authorized base | `8c1a24fe36a9e5e058fbca12ab1a0233ea134cf1` |
 | Product agreement | [PLAN.md](PLAN.md) — protected, unchanged by this revision |
 | Compact projection | [ARCHITECTURE-for-agents.md](ARCHITECTURE-for-agents.md) |
 | DHA register | [CRITICAL.md](CRITICAL.md) |
 
-Revision 2.0 is a bounded, owner-authorized current-source evolution: it
-re-describes the product as the **implemented runnable proxy**, separates real
-runtime behavior from the historical library scaffold and from earlier engineering
-proposals, adds diagrams of the system boundary, component ownership, the
-request/repair lifecycle and cancellation, and reports the actual runtime values.
-The stable invariants LR-001…LR-014 and their meanings are preserved; the change
-record and revision law are in [§18](#18-change-control-and-revision-record).
+Revision 2.1 is the current revision: on the 2.0 re-description of the
+**implemented runnable proxy** it adds the transparent relay's early
+forwarding of proven initial reasoning on eligible streams (§5.3), closes the
+inherited defined-logprobs gap on non-200, non-eligible and bypassed Responses
+bodies (R6), and reconciles the PR43 transport and listener clauses with the
+actual default (transparent) mode and the legacy strict mode. It separates
+real runtime behavior from the historical library scaffold and from earlier
+engineering proposals, and reports the actual runtime values. The stable
+invariants LR-001…LR-014 and their meanings are preserved (LR-001 gains the
+bounded forwardable-reasoning exception); the change record and revision law
+are in [§18](#18-change-control-and-revision-record).
 
 On this page: [Purpose](#1-purpose-and-scope) · [Boundary](#2-system-boundary) ·
 [Invariants](#3-fixed-product-invariants) · [Components](#4-components-and-module-ownership)
@@ -31,9 +35,10 @@ Pandoc](#6-text-spans-and-the-pandoc-original-mapping) · [Protection](#7-protec
 
 ## 1. Purpose and scope
 
-SLAIF Slovenian Repair is an **experimental local lab proxy**: an operator
-installs it from this repository and runs it on loopback in the foreground. It is
-not a hosted service, and deployment/release authority is distinct from software
+SLAIF LLM Response Language Repair is a local proxy: an operator installs it
+from this repository and runs it in the foreground, bound to loopback by
+default. It is not a
+hosted service, and deployment/release authority is distinct from software
 correctness (LR-014) — nothing in this document claims a release.
 
 The product completes Slovenian natural-language responses with conservative
@@ -65,14 +70,23 @@ Three layers must not be conflated:
 
 ## 2. System boundary
 
-The product is a single **parent Python 3.12 process** bound to
-`127.0.0.1:18024`. Its accepting loop hands each admitted connection to the one
+The product is a single **parent Python 3.12 process** bound by default to
+`127.0.0.1:18024`; `CONCEPT_HOST` (any IPv4 address) and `CONCEPT_PORT`
+(1–65535) are operator-configurable, and an invalid default fails startup
+before any bind. Its accepting loop hands each admitted connection to the one
 fixed owned handler worker; bounded owned child processes are the only other
 processes it starts: the one-shot DNS resolver for a **named** main-upstream
 host (`upstream_setup.py`; an IP-literal host needs no resolver child), the
 reviewer transport, and Pandoc. It sits between a local client and an existing,
 operator-controlled Responses API model (Qwen), owns no conversation store, and
 makes no public-network claim.
+
+Two handler modes share the listener. The default **transparent** mode
+(`CONCEPT_PASSTHROUGH=1`) relays every route and protocol and applies this
+document's repair contract only to eligible Responses traffic; the legacy
+**strict** mode (`CONCEPT_PASSTHROUGH=0`) serves `POST /v1/responses` only
+(other paths `404`), is pinned to loopback, and keeps `stream: true` fully
+buffered and delayed.
 
 The proxy talks to the model through **two** routes:
 
@@ -90,7 +104,7 @@ network resource; the index is opened read-only and never created or written.
 
 ```mermaid
 flowchart TD
-    c["Client on loopback"]
+    c["Local client<br/>(loopback by default)"]
     p["SLAIF proxy<br/>one parent process"]
     m["Main upstream Qwen<br/>client key forwarded"]
     r["Reviewer Qwen<br/>separate key, fresh request"]
@@ -117,7 +131,7 @@ PLAN basis column is retained from revision 1.1 for traceability.
 
 | ID | Mandatory invariant | PLAN basis |
 | --- | --- | --- |
-| LR-001 | Complete main generation and capture before CPU review, repair inference and delivery of answer text; verify supported upstream completion, not socket closure alone. No provisional original text to the user. | §§1, 3, 11.3 |
+| LR-001 | Complete main generation and capture before CPU review, repair inference and delivery of answer text; verify supported upstream completion, not socket closure alone. No provisional answer original to the user; initial exposed reasoning (never an answer, never repaired) may be forwarded early per §5.3. | §§1, 3, 11.3 |
 | LR-002 | CPU evidence chooses whether review is warranted; no eligible suspicion means zero review calls and unchanged text. Missing evidence does not prove error. | §§1, 7 |
 | LR-003 | Review targets are preassigned words or short phrases at original coordinates, not model tokens or unrestricted sentences. | §§1, 7.2, 8 |
 | LR-004 | Ask about the suitability of the specific expression; permit `keep` and `needs_wider_edit`; do not demand a change. | §8 |
@@ -144,7 +158,7 @@ modules below are the current runtime boundaries in `concept-verification/`:
 | Stage | Module | Owns |
 | --- | --- | --- |
 | Admission | `request_admission.py` | Queue/socket handling **before** any handler work: 1 active + 16 waiting under one absolute monotonic queue deadline; one fixed content-free `503` before intake, forward, engine or review work |
-| Intake | `client_transport.py` | Strict framing (`400`/`413`), bounded body read, body-completeness and intake-timeout rejections (`400`/`408`) — zero main work |
+| Intake | `client_transport.py` (strict) and `passthrough.py` (transparent) | Mode-specific framing and size checks (§5.2): strict rejects any `Transfer-Encoding` and `Content-Length` over 2,000,000 bytes (`400`/`413`); transparent accepts `chunked` within 256 MiB, an absent `Content-Length` is an empty body (`400` `REQUEST_FRAMING_INVALID` / `413` `REQUEST_TOO_LARGE`); body-completeness (`400`) and intake-timeout (`408`) rejections — zero main work |
 | Request contract | `responses_contract.py` | The supported request profile (§5.1); `400` rejections never reach main generation. Contract validation is **not** in `request_admission.py` |
 | Cancellation | `request_lifecycle.py` | The one per-request scope over the exact accepted socket and its owned watcher |
 | Main hop | `upstream_setup.py`, `header_transport.py`, `capture_transport.py` | Upstream connection (owned resolver child for named hosts) and bounded complete capture before any repair |
@@ -164,7 +178,7 @@ flowchart TD
     a["1 Admission<br/>queue, 503 bound"]
     b["2 Intake and contract<br/>framing, body, profile"]
     c["3 Cancellation scope<br/>over exact socket"]
-    d["4 Main hop<br/>forward, bounded capture"]
+    d["4 Main hop<br/>forward, bounded capture<br/>(stream: §5.3 early prefix)"]
     e["5 CPU analysis<br/>Pandoc spans, detection"]
     f["6 Review hop<br/>one fresh batch, optional"]
     g["7 Acceptance and patch<br/>strict, exact spans"]
@@ -183,10 +197,12 @@ packaged library exists.
 
 ## 5. Request and repair lifecycle
 
-A request either fails **before** the main call (admission, intake or
-request-contract rejection — zero main work) or, once the main answer is fully
-and validly captured, enters the **optional** repair path. Optional repair
-failure is a **fail-closed original**, not an error, and it can neither recover a
+A request either fails **before** the main call (admission and intake in both
+modes; request-contract rejection in strict mode — zero main work; in
+transparent mode non-eligible traffic is simply relayed) or, once the main
+answer is fully and validly captured, enters the **optional** repair path.
+Optional repair failure is a **fail-closed original**, not an error, and it
+can neither recover a
 main failure nor change the original completion status.
 
 Admission, intake and contract rejections happen first, with zero main work
@@ -197,12 +213,12 @@ Completed 200 path:
 ```mermaid
 flowchart TD
     v["Validated request<br/>cancel scope started"]
-    f["Main hop<br/>complete bounded capture"]
+    f["Main hop<br/>complete bounded capture<br/>(stream: proven reasoning prefix<br/>forwarded early, §5.3)"]
     c["Completed well-formed 200?"]
     p["Eligibility, Pandoc spans,<br/>bounded detection"]
     r["Isolated batch-v1<br/>fresh strict-JSON request"]
     a["Strict acceptance<br/>and composed validation"]
-    d["Exact patch, logprobs removed,<br/>bounded delivery"]
+    d["Exact patch, logprobs removed,<br/>bounded delivery<br/>(stream: tail after sent prefix)"]
 
     v --> f --> c
     c -->|yes| p
@@ -217,27 +233,50 @@ flowchart TD
     c2["Upstream result<br/>not repair-eligible"]
     n["Recognized non-200 JSON/SSE:<br/>status preserved, logprobs removed,<br/>malformed body unchanged"]
     w["Well-formed 200, unsupported or<br/>explicitly incomplete/error envelope:<br/>no repair, status/error preserved,<br/>logprobs removed"]
-    e["Malformed or truncated main:<br/>502 protocol error, never repaired"]
+    e1["Malformed main: strict 502,<br/>transparent raw byte-identical;<br/>pre-emission truncation: 502;<br/>never repaired"]
+    e2["After emission starts: unprovable tail<br/>or transport failure:<br/>quiet close, no fabricated completion"]
 
     c2 --> n
     c2 --> w
-    c2 --> e
+    c2 --> e1
+    c2 --> e2
     n ~~~ w
-    w ~~~ e
+    w ~~~ e1
+    e1 ~~~ e2
 ```
 
 ### 5.1 Supported request profile
 
-`POST /v1/responses` only (other paths `404`). Stateless input is either one
-nonempty text string or a **client-managed text-only message sequence**: a
-bounded number of messages, each exactly `role` + `content`, with `role` one of
-`user`, `assistant`, `system` or `developer`, and `content` a nonempty bounded
-string or a nonempty list of `input_text` parts. `store: false` is required;
+In the default **transparent** mode the proxy relays every route and protocol,
+modifying only recognized Responses traffic: eligible requests enter the
+repair path, and recognized Responses bodies have defined `logprobs` removed
+(§13). The repair-eligible subset of `POST /v1/responses` traffic is the
+narrow actual predicate: identity encoding; `store` exactly `false`;
+`background` absent or `false`; `previous_response_id` and `conversation`
+absent or null; `stream` a boolean; and plain-text output (`response_format`
+and `text.format` type `text`). Tools, function calls, images and
+multimodal/history input are **forwarded as delivered and are not
+eligibility blockers**: the *answer* must independently satisfy the completed
+output profile below, and a plain final answer is repaired even when the
+request carries tools. Structured output and stored requests are non-eligible
+and bypass repair (still receiving the §13 normalization).
+
+The legacy **strict** mode (`CONCEPT_PASSTHROUGH=0`) serves
+`POST /v1/responses` only (other paths `404`) and enforces the narrow request
+contract before any forward: stateless input is either one nonempty text
+string or a **client-managed text-only message sequence** — a bounded number
+of messages, each exactly `role` + `content`, with `role` one of `user`,
+`assistant`, `system` or `developer`, and `content` a nonempty bounded string
+or a nonempty list of `input_text` parts. `store: false` is required;
 `previous_response_id`, `conversation` and `incomplete_details` are rejected
-(stored chaining is unsupported). No tools, function calls, images or structured
-output; no request `logprobs` or `include`. `stream: false` returns JSON;
-`stream: true` returns the documented delayed-SSE profile. Chat Completions and
-health or models-list endpoints do not exist.
+(stored chaining is unsupported); no tools, function calls, images or
+structured output; no request `logprobs` or `include`. `stream: false` returns
+JSON;
+`stream: true` returns the documented delayed-SSE profile, except that in the
+transparent mode initial exposed reasoning is forwarded early per §5.3 (the
+legacy strict mode keeps SSE fully buffered and delayed). In strict mode Chat
+Completions, health and models-list endpoints do not exist (`404`); in
+transparent mode they are ordinary relayed routes.
 
 Client-managed history means the next turn's input is the client's own message
 sequence carrying the **delivered final answer** from the previous turn: the
@@ -268,21 +307,80 @@ this eligibility check — it never gates, enables or changes repair (§13).
 | Stage | Failure | Response | Main work |
 | --- | --- | --- | --- |
 | Admission | Queue full or 2 s wait deadline missed | fixed content-free `503` | none (before intake) |
-| Intake framing | Repeated `Content-Length`, comma lists, any `Transfer-Encoding`, unsupported `Expect` | content-free `400` + close | none |
-| Intake framing | Missing, nondecimal or over-large `Content-Length` (over 2,000,000 bytes) | `413` | none |
-| Intake body | Fewer bytes delivered than advertised | `400` `REQUEST_BODY_INCOMPLETE` | none |
+| Intake framing (strict) | Repeated `Content-Length` (even equal), comma lists, any `Transfer-Encoding`, any `Expect` | content-free `400` `REQUEST_FRAMING` + close | none |
+| Intake length (strict) | Missing, nondecimal (including signed) or over-2,000,000-byte `Content-Length` | content-free `413` + close (internal rejection reason `REQUEST_LENGTH`; no wire JSON code) | none |
+| Intake body (strict) | Fewer bytes delivered than advertised | `400` `REQUEST_BODY_INCOMPLETE` + close | none |
+| Intake framing (transparent) | Repeated `Content-Length` or `Transfer-Encoding`, combined `Content-Length` + `Transfer-Encoding`, comma, nondecimal or overlong `Content-Length`, non-`chunked` encoding, invalid chunk framing or trailers, fewer bytes delivered than advertised | content-free `400` `REQUEST_FRAMING_INVALID` | none |
+| Intake size (transparent) | Declared or chunk-decoded body over 256 MiB | content-free `413` `REQUEST_TOO_LARGE` | none |
+| Intake (transparent) | Absent `Content-Length` without `Transfer-Encoding` | accepted as an empty body | none |
 | Intake | Intake deadline expired mid-read | bounded best-effort `408` `REQUEST_INTAKE_TIMEOUT` | none |
-| Request contract | Unsupported capability or invalid request | `400` `invalid_request` + bounded reason | none |
-| Main hop | Upstream/setup/header/capture failure, truncated or incomplete SSE, over-limit body | `502` upstream protocol error | main attempted, no repair |
-| Main hop | 200 mode mismatch (declared `stream` versus observed content type) | `502` `RESPONSE_MODE_MISMATCH` | main complete, no repair |
-| Main hop | Malformed main JSON (invalid UTF-8, duplicate keys, nonfinite numbers, non-object) | `502` main error | main complete, no repair |
+| Request contract (strict mode) | Unsupported capability or invalid request | `400` `invalid_request` + bounded reason | none; transparent mode relays non-eligible traffic |
+| Main hop (both modes) | Upstream/setup/header/capture failure; a body that ends short of its declared length, detected inside the bounded capture before emission | `502` upstream protocol error before the response is emitted; for `stream: true` after emission starts, the §5.3 quiet-close contract | main attempted, no repair |
+| Main hop (strict mode) | 200 mode mismatch (declared `stream` versus observed content type); incomplete SSE without terminal; malformed main JSON (invalid UTF-8, duplicate keys, nonfinite numbers, non-object); over-limit body | `502` (`RESPONSE_MODE_MISMATCH` on mode mismatch) | main attempted or complete, no repair; transparent instead uses the actual content type, delivers the §5.3 tail, passes a malformed envelope through byte-identical and falls back to bounded raw passthrough |
 | Repair | Technical optional-stage failure (Pandoc, evidence, batch, transport); one rejected proposal is simply not applied | completed original for whole-pass failures; surviving edits delivered otherwise | main complete |
+| Stream (§5.3, transparent) | Client stall or disconnect beyond the delivery budget, write failure, declared-length truncation, or no usable tail after emission has started | quiet close; partial bytes are never labelled completed; no terminal event or `[DONE]` is invented | main complete or partial; no review after cancellation |
+
 
 Completion is checked against the supported upstream protocol, not socket
 closure (LR-001). A well-formed upstream envelope that is unsupported, or that
 explicitly carries an incomplete or error status, is **not** a main failure:
 its status, finish and error semantics are preserved through delivery while
 defined `logprobs` are still removed (§13).
+
+### 5.3 Streaming early-reasoning profile (transparent SSE)
+
+For `stream: true` on a repair-eligible 200 `text/event-stream` (identity
+encoding), the proxy forwards the **initial exposed reasoning prefix** as
+frames complete while the body is still captured; from the first unproven
+frame on, the ordinary whole-body path decides the tail. No answer text is
+ever forwarded early. A complete frame is forwarded only when its structure
+is explicitly proven reasoning: a proven reasoning item (a `reasoning` output
+item whose carried parts are all proven), a proven reasoning or summary part
+(part types `reasoning_text` and `summary_text`), a reasoning or summary text
+delta (the `reasoning_text` and `reasoning_summary_text` families), a
+`content_part` frame only when its part is a proven reasoning part, or a
+response-start lifecycle snapshot whose `output` list is proven reasoning-only
+(a missing snapshot or list is unproven and buffers). Embedded
+`response`/`item`/`part`/`output` carriers must themselves be proven
+reasoning-only. Terminal events and the `[DONE]` marker, malformed frames,
+unknown field lines, duplicate labels, a missing JSON `type`, and a label that
+mismatches the JSON `type` all buffer instead of guessing; `event`/`id`/`retry`
+labels honor the SSE spec's single optional space after the colon, `data`
+keeps its post-colon bytes, and framing-only empty frames pass through.
+
+Forwarding is **one-way**: the first unproven frame is the buffer boundary,
+irrevocably buffering that frame and every later one; frames are never
+reordered, reclassified or replayed. Each forwarded frame uses the strict
+parser's own object with defined `logprobs` removed at the same locations and
+re-rendered by the shared renderer, so the sent prefix is frame-identical to
+the whole-body transform's output for the same ordinals; after a valid
+completed envelope, the tail is the transform's remaining blocks and a
+per-ordinal comparison against the sent prefix must match exactly; an ordinal
+mismatch degrades to the normalized tail, and a non-recoverable validation
+failure yields no tail at all. An envelope that is not a valid completed one
+passes the tail from the boundary with the owner's unconditional defined-
+logprobs removal (zero review); a malformed tail stays byte-identical, as
+does the over-limit raw fallback.
+
+After the status and headers are sent, every tail that is produced is
+delivered, and the connection then ends honestly with no fabricated terminal:
+a framing-complete tail that is incomplete, failed, unsupported or otherwise
+not a valid completed envelope passes from the boundary with the §13
+normalization, a malformed tail stays byte-identical, and the over-limit
+fallback continues raw. The connection is closed **quietly** — no second
+response, no terminal event or `[DONE]` is invented, and partial bytes are
+never labelled completed — when no usable tail exists or the transport itself
+fails: a stream with proven reasoning frames but no boundary (no answer, no
+terminal), an unprovable result after the prefix, a client that stalls or
+disconnects beyond the delivery budget, a write failure, or a body that ends
+short of its declared length. The delivery budget
+(`CONCEPT_DELIVERY_TIMEOUT`) bounds prefix
+emission by **cumulative active client-write time** — only real write/flush
+time of the status/headers and each prefix frame counts; upstream capture and
+optional review waits are excluded and never arm or extend the clock. The
+buffered tail then goes out under one fresh delivery deadline anchored at its
+emission, and client cancellation aborts request-owned work without starting
+a new review.
 
 ## 6. Text, spans and the Pandoc original mapping
 
@@ -547,9 +645,15 @@ The proxy **does not provide token probabilities**. Defined Responses API
 response locations (the `output_text` deltas/done events, content-part
 added/done events, message content parts of output-item added/done events, and
 the nested `output` message content of the six lifecycle snapshot events), for
-every value, independently of optional repair, on both the nonstreaming JSON
-path and the retained delayed-SSE path. There is no operator switch, per-request
-flag, or eligibility interaction.
+every value, independently of optional repair, on the nonstreaming JSON path,
+the streamed reasoning prefix (§5.3) and the buffered delayed-SSE tail. The
+policy reaches **every recognized Responses-route body**: captured
+non-streaming JSON of any status, including 200 requests that bypass repair
+(structured output, stored, or otherwise non-eligible), and bypass SSE is
+filtered **incrementally per complete frame** on the original bytes — only
+the bounded unterminated tail is retained, and a malformed frame or over-limit
+tail switches the remainder to verbatim relay in original order. There is no
+operator switch, per-request flag, or eligibility interaction.
 
 Normalization applies **beyond completed 200 paths**: recognized **non-200**
 JSON/SSE bodies are normalized by their actual content type as well, and a
@@ -570,13 +674,13 @@ defaults; an invalid default fails startup before any bind allocation):
 
 | Budget | Env | Default | Scope |
 | --- | --- | --- | --- |
-| Incoming request size | fixed | 2,000,000 bytes | advertised `Content-Length` (`413`) |
+| Incoming request size | fixed | strict 2,000,000; transparent 256 MiB | strict: advertised `Content-Length`; transparent: advertised or chunk-decoded total (`413`) |
 | Main body hard capture | fixed | 8,000,000 bytes | main response capture |
 | Upstream socket/body capture | `CONCEPT_TIMEOUT` | 30 s | main body capture |
 | Response-header acquisition | `CONCEPT_HEADER_TIMEOUT` | 30 s | status/header phase |
 | Main-upstream setup | `CONCEPT_SETUP_TIMEOUT` | 30 s | connect/TLS/upload before response |
 | Incoming-client intake | `CONCEPT_REQUEST_TIMEOUT` | 30 s | accepted-connection intake |
-| Final delivery | `CONCEPT_DELIVERY_TIMEOUT` | 30 s | final response emission |
+| Final delivery | `CONCEPT_DELIVERY_TIMEOUT` | 30 s | response emission (streamed prefix: cumulative active client-write time; tail: fresh anchor) |
 | Reviewer whole exchange | `CONCEPT_REVIEWER_TIMEOUT` | 15 s | one monotonic batch deadline |
 | Accepted-connection admission | fixed | 1 active + 16 waiting, 2 s wait | admission queue |
 | Analysis eligibility | fixed | 32,768 code points / 131,072 UTF-8 bytes | optional analysis gate |
@@ -701,4 +805,15 @@ runtime law, and never rewrite historical seeds to hide a revision.
 | Authorization | Order 037-a (pinned immutable), explicit owner documentation professionalization instruction 2026-11-12 |
 | Scope | Editorial reorganization and accurate implemented-runtime description; stable LR meanings and immutable product agreement retained |
 | Semantic delta | Re-describes the product as the implemented runnable proxy (process topology including the owned resolver child, admission/intake/contract ordering, error contract including the well-formed 200 unsupported/incomplete/error envelope, non-200 metadata normalization, Pandoc position mapping, the two strict-acceptance routes, byte-unit budgets); adds five diagrams; separates historical scaffold and PLAN proposals from runtime; no product, PLAN, LR, or protected-source change |
+| Projections | Compact architecture, distillation map, manifest and generated-file identities synchronized in the same PR against the trusted accepted base |
+
+### 18.3 Current revision (2.1, 2026-11-15)
+
+| Field | Value |
+| --- | --- |
+| Prior revision | 2.0, SHA-256 `4df1664cec86aae1e3e07e19f61650919fa8dc5011acc67f411848eeee0a8ed9` |
+| Accepted base | `8c1a24fe36a9e5e058fbca12ab1a0233ea134cf1` |
+| Authorization | Order 038-a (pinned immutable), explicit owner early-reasoning-streaming instruction 2026-11-15 |
+| Scope | Initial exposed reasoning may precede completed answer capture; answer repair and delivery, exact spans and strict acceptance unchanged; affected PR43 transport, listener and intake clauses reconciled |
+| Semantic delta | New §5.3 streaming early-reasoning profile (proven-reasoning allowlist, one-way buffer boundary, ordinal mapping, no fabricated completion, quiet close only where no usable tail or the transport fails); LR-001 forwardable-reasoning exception; §5.2 pre-emission 502 on declared-length truncation plus post-emission quiet-close contract; R6 closure of the inherited defined-logprobs gap — every recognized Responses-route body is normalized, including non-200, non-eligible 200 (bypass) JSON of any status and incrementally filtered bypass SSE; transparent/strict mode, listener and intake framing/size facts (strict: declared `Content-Length` up to 2,000,000 bytes, any `Transfer-Encoding` rejected; transparent: 256 MiB, `chunked` accepted, absent `Content-Length` an empty body) reconciled with the actual default; §14 delivery-budget scope (cumulative active client-write time, fresh tail anchor); current service title |
 | Projections | Compact architecture, distillation map, manifest and generated-file identities synchronized in the same PR against the trusted accepted base |
