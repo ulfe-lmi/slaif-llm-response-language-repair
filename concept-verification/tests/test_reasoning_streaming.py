@@ -43,6 +43,7 @@ baseline and must keep passing after implementation.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import contextlib
 import http.client
 import json
@@ -593,21 +594,52 @@ def _contract_body_stream() -> bytes:
 
 
 def _early_exchange(harness: _ReasoningHarness, body: bytes, cap: _ClientCapture,
-                    early_wait: float = 1.5) -> bool:
-    """Release the upstream only after the client saw the reasoning canary.
+                    early_wait: float = 1.5,
+                    release_marker: bytes = _CANARY,
+                    wait_barrier_entered: bool = False,
+                    hold: float = 0.0,
+                    pre_release_check: Callable[[], None] | None = None) -> bool:
+    """Release the upstream only after the client saw ``release_marker``.
 
-    Returns True when early client receipt was proved (canary observed
-    while the upstream was still blocked on its barrier).  The
+    Returns True when early client receipt was proved (marker observed
+    while the upstream was still blocked on its barrier).  The marker
+    defaults to the reasoning canary; a test may gate release on its
+    intended FINAL prefix marker instead, so the barrier can never be
+    released before every frame the pre-release assertions need has
+    reached the client (followup review 4: release-marker race).  With
+    ``wait_barrier_entered`` the fixture's explicit barrier-entered
+    signal is also awaited BEFORE the immutable snapshot, proving the
+    fake flushed its whole blocked section.  With ``hold > 0`` the gate
+    stays held for a bounded negative observation window first;
+    ``pre_release_snapshot`` is then refreshed to the LATEST pre-release
+    client view (after the hold, before release) and ``pre_release_check``
+    runs while the gate is still held, so both observe the whole negative
+    hold interval - never the post-release final output.  The
     pre-release observations are stored on ``cap``
     (``first_canary_snapshot``, ``pre_release_snapshot``) BEFORE the
     release Event is set; the final ``cap.blob`` is only valid after
     this function returns.
     """
-    thread = _start_client(harness.proxy_port, body, cap)
+    thread = _start_client(harness.proxy_port, body, cap, canary=release_marker)
     early = cap.canary_seen.wait(early_wait)
+    if early and wait_barrier_entered:
+        if not _StreamUpstream.barrier_entered.wait(early_wait):
+            # Fixture liveness failure (fake never reached its barrier):
+            # no release, no early-receipt claim.
+            early = False
     if early:
-        # Immutable observation while the upstream is still blocked.
+        if hold > 0:
+            # Bounded negative observation window while the gate is
+            # still held; corroborates absence, never a positive proof.
+            deadline = time.monotonic() + hold
+            while time.monotonic() < deadline and not cap.finished.is_set():
+                time.sleep(0.02)
+        # Immutable observation while the upstream is still blocked,
+        # refreshed AFTER the optional hold so it covers the whole
+        # pre-release client view (negative hold interval included).
         cap.pre_release_snapshot = cap.blob
+        if pre_release_check is not None:
+            pre_release_check()
         release = _StreamUpstream.release
         if release is not None:
             release.set()
@@ -761,6 +793,78 @@ class EarlyReasoningBarrierTests(_ReasoningStreamingBase):
         self.assertEqual(final.count(_CANARY), 5)
         self.assertEqual(self.harness.review_calls(), 1)
 
+    def test_answer_delta_flushed_still_withheld_before_completion(self) -> None:
+        # Completion-gate proof (followup review 4): the fake flushes
+        # the complete reasoning prefix AND the message answer delta,
+        # then blocks BEFORE the terminal answer copies and completion.
+        # A correct runtime buffers from the first message frame, so the
+        # reasoning prefix reaches the client while the ALREADY-FLUSHED
+        # answer text stays withheld and no review is dispatched while
+        # the gate is held.  This exercises the actual completion gate
+        # rather than relying on the fake's answer absence (A1/A2
+        # block before any answer byte exists upstream).  Zero-review
+        # control: A1.
+        self.review_payload = _review_payload([
+            _prop("t0", keep=False, replacement="presenetljiv"),
+            _prop("t1", keep=False, replacement="presenetljiv"),
+        ])
+        self.harness.close()
+        self.harness = _ReasoningHarness(
+            review_payload=self.review_payload)
+        payloads = _stream_payloads(_ANSWER)
+        # Single-delta stream layout: frame 10 is the answer delta
+        # (sequence 10); frames 11-14 are the terminal answer copies
+        # and completion.
+        cut = 11
+        before = _render_stream(payloads[:cut])
+        after = _render_stream(payloads[cut:])
+        # Fixture liveness: the answer delta is really flushed BEFORE
+        # the barrier, and the reasoning canary is in the prefix.
+        self.assertIn(_CANARY, before)
+        self.assertIn(b"presenetliv", before)
+        self.assertNotIn(b"response.completed", before)
+        self.harness.upstream(
+            before=before, after=after, barrier=True,
+            inter_frame_sleep=0.004, barrier_timeout=4.0)
+        cap = _ClientCapture()
+
+        def no_review_while_held() -> None:
+            self.assertEqual(
+                self.harness.review_calls(), 0,
+                "review dispatched while the completion gate was held")
+
+        early = _early_exchange(
+            self.harness, _contract_body_stream(), cap,
+            wait_barrier_entered=True, hold=0.5,
+            pre_release_check=no_review_while_held)
+        self.assertTrue(
+            early,
+            "no early reasoning delivery while upstream blocked: expected "
+            "pre-038 baseline failure (whole-body SSE buffering before "
+            "any emission)")
+        # The fake flushed the answer delta and is provably blocked.
+        self.assertTrue(_StreamUpstream.barrier_entered.is_set())
+        # Immutable pre-release view (release Event unset, gate held,
+        # refreshed after the 0.5 s negative hold interval): reasoning
+        # received, answer withheld although already flushed upstream,
+        # no completion, no second status.  The no-review check ran
+        # after the hold and before release, while the gate was held.
+        snapshot = cap.pre_release_snapshot
+        self.assertIn(_CANARY, snapshot)
+        self.assertNotIn(b"presenetliv", snapshot)
+        self.assertNotIn(b"response.output_text.delta", snapshot)
+        self.assertNotIn(b"response.output_text.done", snapshot)
+        self.assertNotIn(b"response.completed", snapshot)
+        self.assertIsNone(cap.error, f"client error: {cap.error!r}")
+        self.assertEqual(cap.status, 200)
+        # After release: full capture completed first, then the exact
+        # edited stream at every answer copy with reasoning untouched,
+        # and exactly one review (the legitimate post-completion one).
+        self.assertEqual(cap.blob, _expected_edited(payloads, _EDITED_ANSWER))
+        self.assertNotIn(b"presenetliv", cap.blob)
+        self.assertEqual(cap.blob.count(_CANARY), 5)
+        self.assertEqual(self.harness.review_calls(), 1)
+
     def test_split_utf8_crlf_frames_early_receipt(self) -> None:
         # Arbitrary byte chunking (3-byte writes) forces UTF-8 code-point
         # and frame-delimiter (CRLF) splits inside the early prefix; the
@@ -804,6 +908,10 @@ EXPECTED_BASELINE_FAILURES: tuple[str, ...] = (
     "EarlyReasoningBarrierTests.test_zero_review_reasoning_arrives_while_upstream_blocked",
     "EarlyReasoningBarrierTests.test_accepted_edit_reasoning_before_release_answer_withheld",
     "EarlyReasoningBarrierTests.test_split_utf8_crlf_frames_early_receipt",
+    # A: completion gate with the answer delta already flushed upstream
+    # (followup review 4): fails on baseline at the same early-receipt
+    # assertion as the other A tests.
+    "EarlyReasoningBarrierTests.test_answer_delta_flushed_still_withheld_before_completion",
     # B: valid early prefix that the baseline withholding also hides
     # (the classification-specific assertions inside these tests are
     # the draft-guard portion; they only become observable once early
@@ -813,6 +921,14 @@ EXPECTED_BASELINE_FAILURES: tuple[str, ...] = (
     "LabelAndAmbiguityTests.test_sse_optional_space_label_variants",
     "LabelAndAmbiguityTests.test_unknown_shape_reasoning_part_not_safe_prefix",
     "LabelAndAmbiguityTests.test_malformed_json_frame_stops_early_forwarding",
+    # C5 now proves blocked-upstream early receipt for the DOCUMENTED
+    # summary-part family (followup review 4), so it baseline-fails
+    # like the other early-receipt tests.  It also pins the documented
+    # response.reasoning_summary_part.*/response.reasoning_summary_text.*
+    # family in the runtime allowlist: a candidate that only accepts the
+    # native qwen family fails this test even after the 038 baseline
+    # (independent finding, see secondary-review.json).
+    "OrderAndReplayTests.test_summary_text_family_variant",
 )
 
 
@@ -921,7 +1037,18 @@ class LabelAndAmbiguityTests(_ReasoningStreamingBase):
             before=source[:start], after=source[start:],
             barrier=True, inter_frame_sleep=0.004, barrier_timeout=4.0)
         cap = _ClientCapture()
-        early = _early_exchange(self.harness, _contract_body_stream(), cap)
+        # Release is gated on the intended FINAL prefix marker (the full
+        # reasoning text, first delivered by the last pre-boundary
+        # frame), not on the first common canary: the client may see
+        # the canary in the first delta before the second (no-space)
+        # frame arrives, which would race the pre-release snapshot
+        # (followup review 4).  barrier_entered additionally proves the
+        # fake flushed its entire blocked section before the immutable
+        # snapshot; no sleep acts as a positive proof.
+        early = _early_exchange(
+            self.harness, _contract_body_stream(), cap,
+            release_marker=reasoning.encode(),
+            wait_barrier_entered=True)
         self.assertTrue(
             early,
             "no early reasoning delivery while upstream blocked: expected "
@@ -1359,37 +1486,48 @@ class OrderAndReplayTests(_ReasoningStreamingBase):
         self.assertEqual(self.harness.review_calls(), 1)
 
     def test_summary_text_family_variant(self) -> None:
-        # The documented summary_text reasoning family (summary parts and
-        # reasoning_summary_text events) is handled exactly like the
-        # native reasoning_text family: byte-identical zero-review
-        # delivery, reasoning protected, no review.
+        # The DOCUMENTED Responses summary-part family (reasoning summary
+        # part events plus reasoning_summary_text delta/done,
+        # part.type=summary_text) must stream early exactly like the
+        # native reasoning_text family.  This is a BLOCKED-UPSTREAM
+        # early-receipt proof: the summary canary must reach the client
+        # while the fake is still blocked; a final-only content check is
+        # not proof of early summary streaming (followup review 4).  The
+        # final bytes remain the byte-identical zero-review control with
+        # the final summary item shape retained.
+        #
+        # Protocol note: the runtime allowlist must cover these
+        # documented event names (response.reasoning_summary_part.added/
+        # done, response.reasoning_summary_text.delta/done); a candidate
+        # that only accepts the native qwen family fails this early
+        # receipt (independent finding, secondary-review.json).
         reasoning = "povzetek-z-038 preverim obliko."
         canary = b"povzetek-z-038"
         payloads = [
             _created(0),
             _in_progress(1),
             _reasoning_item_added(2),
-            {"type": "response.content_part.added", "sequence_number": 3,
-             "item_id": "rs_1", "output_index": 0, "content_index": 0,
+            {"type": "response.reasoning_summary_part.added",
+             "sequence_number": 3, "item_id": "rs_1", "output_index": 0,
+             "summary_index": 0,
              "part": {"type": "summary_text", "text": ""}},
-            {"type": "response.reasoning_summary_text.added",
-             "sequence_number": 4, "item_id": "rs_1", "output_index": 0,
-             "content_index": 0, "summary_index": 0},
             {"type": "response.reasoning_summary_text.delta",
-             "sequence_number": 5, "item_id": "rs_1", "output_index": 0,
-             "content_index": 0, "summary_index": 0, "delta": reasoning},
+             "sequence_number": 4, "item_id": "rs_1", "output_index": 0,
+             "summary_index": 0, "delta": reasoning},
             {"type": "response.reasoning_summary_text.done",
              "sequence_number": 6, "item_id": "rs_1", "output_index": 0,
-             "content_index": 0, "summary_index": 0, "text": reasoning},
-            {"type": "response.content_part.done", "sequence_number": 7,
-             "item_id": "rs_1", "output_index": 0, "content_index": 0,
+             "summary_index": 0, "text": reasoning},
+            {"type": "response.reasoning_summary_part.done",
+             "sequence_number": 7, "item_id": "rs_1", "output_index": 0,
+             "summary_index": 0,
              "part": {"type": "summary_text", "text": reasoning}},
             {"type": "response.output_item.done", "sequence_number": 8,
              "output_index": 0,
              "item": {"type": "reasoning", "id": "rs_1",
                       "status": "completed",
                       "summary": [{"type": "summary_text",
-                                   "text": reasoning}]}},
+                                   "text": reasoning}],
+                      "content": []}},
             _message_item_added(9),
             _answer_part_added(10),
             _answer_delta(11, _CLEAN),
@@ -1405,12 +1543,39 @@ class OrderAndReplayTests(_ReasoningStreamingBase):
             {"type": "summary_text", "text": reasoning}]
         payloads.append(completed)
         source = _render_stream(payloads)
-        self.harness.upstream(before=source, after=b"")
-        status, body = _one_shot(self.harness.proxy_port,
-                                 _contract_body_stream())
-        self.assertEqual(status, 200)
-        self.assertEqual(body, source)
-        self.assertEqual(body.count(canary), 5)
+        # Blocked section: the whole summary prefix (through the
+        # summary_part.done frame, index 7).  Release is gated on the
+        # summary canary (first delivered by the delta frame) plus the
+        # fake's barrier-entered signal, so the immutable pre-release
+        # snapshot covers the entire flushed prefix.
+        cut = 8
+        before = _render_stream(payloads[:cut])
+        after = _render_stream(payloads[cut:])
+        self.harness.upstream(
+            before=before, after=after, barrier=True,
+            inter_frame_sleep=0.004, barrier_timeout=4.0)
+        cap = _ClientCapture()
+        early = _early_exchange(
+            self.harness, _contract_body_stream(), cap,
+            release_marker=canary, wait_barrier_entered=True)
+        self.assertTrue(
+            early,
+            "no early summary-family reasoning delivery while upstream "
+            "blocked: expected pre-038 baseline failure (whole-body SSE "
+            "buffering before any emission)")
+        # Pre-release observation: summary reasoning arrived early;
+        # answer and completion withheld.
+        snapshot = cap.pre_release_snapshot
+        self.assertIn(canary, snapshot)
+        self.assertNotIn(b"response.output_text.delta", snapshot)
+        self.assertNotIn(b"response.completed", snapshot)
+        self.assertNotIn(_CLEAN.encode(), snapshot)
+        self.assertIsNone(cap.error, f"client error: {cap.error!r}")
+        self.assertEqual(cap.status, 200)
+        # Final control: byte-identical zero-review delivery; the
+        # summary canary appears once per summary copy (5 copies).
+        self.assertEqual(cap.blob, source)
+        self.assertEqual(cap.blob.count(canary), 5)
         self.assertEqual(self.harness.review_calls(), 0)
 
 
