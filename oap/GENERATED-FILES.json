@@ -16,14 +16,14 @@
    "sha256": "118be17b2e9e5b50d628c796b136ee1b8154ebf844af0007839f65848fd69f09"
   },
   "ARCHITECTURE-for-agents.md": {
-   "bytes": 19980,
+   "bytes": 19993,
    "class": "generated",
-   "sha256": "53328fa21328108fa65d28424e0baccbd3b29280699144aa09c7e45dbff084a1"
+   "sha256": "0e87e2cc5c7e5e7c80e2f8d3c1103bb98624a1cdd2adc4c3027368f7976e0193"
   },
   "ARCHITECTURE.md": {
-   "bytes": 42835,
+   "bytes": 53186,
    "class": "immutable",
-   "sha256": "4df1664cec86aae1e3e07e19f61650919fa8dc5011acc67f411848eeee0a8ed9"
+   "sha256": "5caa7a116e600bdcad3a3ff569735bd12a9b5176876a71effe030dff074539c8"
   },
   "CRITICAL.md": {
    "bytes": 10684,
@@ -56,9 +56,9 @@
    "class": "generated"
   },
   "README.md": {
-   "bytes": 5768,
+   "bytes": 5865,
    "class": "generated",
-   "sha256": "8f142cf469e408510bbe26b961baa27942ce6965ad3e00c99a23537b0989087e"
+   "sha256": "d66024c4b745ab1aec7b2fdc6bf97bda61a872ec69da943e949a5a7f5d8c5313"
   },
   "SECURITY.md": {
    "bytes": 2266,
@@ -423,17 +423,17 @@
   "oap/governance/CONTEXT-BUDGET.md": {
    "bytes": 1253,
    "class": "generated",
-   "sha256": "90a8f6d65bc5f9a8f08db87c038bcd82b7b110b95da053ec963a59507b0696f6"
+   "sha256": "61b5765caed6b1d5ce365ee558fe3ec2e41a78f9e01f0062a642cae59fbf123a"
   },
   "oap/governance/DISTILLATION-MAP.md": {
-   "bytes": 72470,
+   "bytes": 72455,
    "class": "generated",
-   "sha256": "d5f4c1fbb546f552dcd1a28b81725cc714b1c9820317d714fbe5c2dcbd2f9193"
+   "sha256": "26059b0dc17cacc4bed61d5eabe92580bfdd4d495e2b7605a53f0e3eb92e5f80"
   },
   "oap/governance/MANIFEST.json": {
-   "bytes": 76307,
+   "bytes": 76502,
    "class": "generated",
-   "sha256": "08b9b2dbcb29cdf218b5b044023735fae066d49edb85643ed9cee609fcc3d344"
+   "sha256": "1c0e4ee22f66d141c0f7d99d3c22750456d931e5b2251feab948474454b6dcaa"
   },
   "oap/governance/WORKSPACE-LAYOUT.json": {
    "bytes": 1131,
@@ -892,8 +892,8 @@
   },
   "docs/PROXY-CHAINING.md": {
    "class": "generated",
-   "sha256": "7dae1964532921d63a9edf3cd0ae4713eeb38fc554338fc1f62a03654958d159",
-   "bytes": 4686
+   "sha256": "b11d719f3cdfed049b63885b075c1fcb61089ce4e9dd07df228bf011ba86283d",
+   "bytes": 4841
   },
   "oap/tests/test_repository_rename.py": {
    "class": "generated",

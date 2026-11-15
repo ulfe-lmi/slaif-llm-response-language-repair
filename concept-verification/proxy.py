@@ -163,6 +163,13 @@ def _event(block: str) -> dict[str, object] | None:
     return _strict_json_object("\n".join(data_lines))
 
 
+# Byte-level SSE frame delimiters (the byte counterpart of the strict
+# runtime parser's \r\n\r\n|\n\n frame split, order 038-a R6): a frame
+# is complete only at a full delimiter, so the bypass filter can frame
+# original bytes before any decoding and never partially decode UTF-8.
+_SSE_FRAME_DELIMITERS = re.compile(rb"\r\n\r\n|\n\n")
+
+
 def _events(raw: bytes) -> list[tuple[str, dict[str, object]]]:
     result: list[tuple[str, dict[str, object]]] = []
     for block, _delimiter in _split_sse(raw):
@@ -2049,15 +2056,18 @@ class _PassthroughHandler(_Handler):
         started: float,
     ) -> bytes:
         owner = cast(ConceptProxy, self.server)
-        # Unsupported or malformed envelopes are opaque passthrough. In
-        # particular, tool calls and structured output never enter repair or
-        # metadata normalization merely because they share a Responses route.
+        # Malformed envelopes are opaque byte-identical passthrough.  A
+        # well-formed non-completed or unsupported envelope never enters
+        # repair, but the owner's unconditional defined-logprobs removal
+        # still applies to its recognized defined locations (order 038-a
+        # R6: inherited PR43 gap closed); bodies without defined logprobs
+        # pass through unchanged.
         try:
             if media_type == "application/json":
                 if validate_completed_envelope(_strict_json_body(raw)) is None:
-                    return raw
+                    return normalize_json_body(raw)
             elif not _sse_completed_ok(raw):
-                return raw
+                return normalize_sse_body(raw)
         except (ProxyError, ValueError, OverflowError, RecursionError):
             return raw
         owner.engine.begin_request(scope)
@@ -2353,7 +2363,7 @@ class _PassthroughHandler(_Handler):
                             ) as exc:
                                 owner.engine.abort_request(owner.observe_usage)
                                 if isinstance(exc, ProxyError):
-                                    tail = prefix[boundary:]
+                                    tail = normalize_sse_body(prefix[boundary:])
                                 else:
                                     tail = None
                             else:
@@ -2368,8 +2378,11 @@ class _PassthroughHandler(_Handler):
                                 transformed = True
                         else:
                             # No valid completed envelope: the tail
-                            # passes through raw from the boundary.
-                            tail = prefix[boundary:]
+                            # passes through from the boundary with the
+                            # owner's unconditional defined-logprobs
+                            # removal (order 038-a R6); a malformed tail
+                            # stays byte-identical.
+                            tail = normalize_sse_body(prefix[boundary:])
                     if tail is None:
                         # Honest post-header failure: quiet close, no
                         # second response, no fabricated completion.
@@ -2401,6 +2414,173 @@ class _PassthroughHandler(_Handler):
                     original = prefix
                     prefix = self._transform(prefix, media_type, scope, started)
                     transformed = prefix != original
+            elif (
+                self.command == "POST"
+                and self.path.split("?", 1)[0] == "/v1/responses"
+                and media_type == "application/json"
+                and response.getheader(
+                    "Content-Encoding", "identity"
+                ).lower() == "identity"
+                and (
+                    response.status != 200
+                    or not self._repair_candidate(body)
+                )
+            ):
+                # Owner's unconditional defined-logprobs policy
+                # (order 038-a R6): a recognized JSON response on the
+                # Responses route that does not take the repair path
+                # (a non-200, or a 200 request bypass) is captured
+                # under the same bounded capture and normalized;
+                # malformed bodies stay byte-identical, an over-limit
+                # body falls back to the raw continuation, and a
+                # truncated body is an observable main failure.
+                # Neither path adds repair or review, and SSE of any
+                # status keeps its raw early passthrough.
+                chunks: list[bytes] = []
+                size = 0
+                oversize = False
+                while size <= MAIN_BODY_MAX_BYTES:
+                    scope.raise_if_cancelled()
+                    chunk = response.read1(
+                        min(65536, MAIN_BODY_MAX_BYTES + 1 - size)
+                    )
+                    if not chunk:
+                        if response.length not in (None, 0):
+                            raise ProxyError("incomplete upstream body")
+                        break
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size > MAIN_BODY_MAX_BYTES:
+                        oversize = True
+                        break
+                if oversize:
+                    # PR43-style raw continuation: emit the captured
+                    # prefix and relay the remainder unchanged.
+                    prefix = b"".join(chunks)
+                else:
+                    if guard.release():
+                        raise ProxyError("upstream body deadline expired")
+                    guard = None
+                    body = b"".join(chunks)
+                    prefix = normalize_json_body(body)
+                    transformed = prefix != body
+                    buffered = True
+            elif (
+                self.command == "POST"
+                and self.path.split("?", 1)[0] == "/v1/responses"
+                and media_type == "text/event-stream"
+                and response.getheader(
+                    "Content-Encoding", "identity"
+                ).lower() == "identity"
+            ):
+                # Owner's unconditional defined-logprobs policy
+                # (order 038-a R6): an SSE response on the Responses
+                # route that does not take the repair path keeps its
+                # raw early passthrough under a bounded byte-frame
+                # filter: frames are split on the original bytes at
+                # the strict LF/CRLF delimiters, a complete frame is
+                # strictly decoded and parsed, defined logprobs are
+                # removed at the shared locations, and the frame is
+                # re-rendered only when changed.  Only the original
+                # unterminated tail is retained, bounded by
+                # MAIN_BODY_MAX_BYTES.  A malformed or undecodable
+                # frame, or over-limit tail growth, switches the
+                # remainder to verbatim relay (one-way, original byte
+                # order, the retained tail flushed exactly once);
+                # frames are never reordered, dropped or re-decoded
+                # and no terminal event is invented.
+                scope.raise_if_cancelled()
+                raw_mode = False
+                pending: bytes = b""
+
+                def emit_filtered() -> None:
+                    assert response is not None
+                    nonlocal raw_mode, pending
+                    self.send_response_only(response.status, response.reason)
+                    excluded = (
+                        passthrough.hop_headers(response.headers)
+                        | {"content-length", "etag", "content-md5",
+                           "digest", "content-digest"}
+                    )
+                    for key, value in response.getheaders():
+                        if key.lower() not in excluded:
+                            self.send_header(key, value)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+
+                    def on_frame(frame: bytes) -> None:
+                        """Filter one complete delimited frame (bytes,
+                        delimiter included); unfiltered frames pass
+                        through byte-identical."""
+                        nonlocal raw_mode
+                        if not raw_mode:
+                            if frame.endswith(b"\r\n\r\n"):
+                                block_bytes, delim = frame[:-4], b"\r\n\r\n"
+                            else:
+                                block_bytes, delim = frame[:-2], b"\n\n"
+                            try:
+                                block = block_bytes.decode("utf-8")
+                                value = _event(block)
+                            except (
+                                UnicodeDecodeError, ProxyError, ValueError,
+                                OverflowError, RecursionError,
+                            ):
+                                raw_mode = True
+                            else:
+                                if (
+                                    value is not None
+                                    and sse_streaming.strip_event_logprobs(value)
+                                ):
+                                    frame = (
+                                        _render_event(block, value).encode("utf-8")
+                                        + delim
+                                    )
+                        self.wfile.write(frame)
+                        self.wfile.flush()
+
+                    def scan(data: bytes) -> None:
+                        nonlocal raw_mode, pending
+                        if raw_mode:
+                            self.wfile.write(data)
+                            self.wfile.flush()
+                            return
+                        buf = pending + data
+                        pending = b""
+                        last = 0
+                        for match in _SSE_FRAME_DELIMITERS.finditer(buf):
+                            on_frame(buf[last:match.end()])
+                            last = match.end()
+                            if raw_mode:
+                                # One-way verbatim fallback: the
+                                # untouched remainder flushes exactly
+                                # once, in original order.
+                                self.wfile.write(buf[last:])
+                                self.wfile.flush()
+                                return
+                        pending = buf[last:]
+                        if len(pending) > MAIN_BODY_MAX_BYTES:
+                            # Delimiter-free growth past the bound:
+                            # coherent verbatim over-limit fallback.
+                            self.wfile.write(pending)
+                            self.wfile.flush()
+                            pending = b""
+                            raw_mode = True
+
+                    while True:
+                        scope.raise_if_cancelled()
+                        chunk = response.read1(65536)
+                        if not chunk:
+                            if response.length not in (None, 0):
+                                raise ProxyError("incomplete upstream body")
+                            if pending:
+                                self.wfile.write(pending)
+                                self.wfile.flush()
+                                pending = b""
+                            break
+                        scan(chunk)
+
+                self._deliver(emit_filtered)
+                return
             scope.raise_if_cancelled()
 
             def emit() -> None:
