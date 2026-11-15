@@ -39,6 +39,17 @@ until completed capture).  Those failures are the ordered "expose
 current baseline lack of early reasoning" evidence and are distinct
 from fixture/setup bugs: all non-barrier content tests must PASS on the
 baseline and must keep passing after implementation.
+
+R6 (owner's unconditional logprobs policy, inherited PR43 gap): a
+distinct failure set, EXPECTED_R6_BASELINE_FAILURES, documents tests
+that fail on the pre-038 baseline AND on the pre-fix 038 candidate
+because the defined-location logprobs removal never applied to
+non-completed / non-200 recognized representations: 200 incomplete
+SSE after a streamed reasoning prefix, explicit incomplete/failed
+terminals carrying the answer, 200 incomplete JSON, the absent/null/
+empty/populated/unexpected value matrix, and 400 recognized JSON.
+They must pass on the R6-fixed runtime while the completed zero-review
+control and every non-barrier content test pass on both epochs.
 """
 
 from __future__ import annotations
@@ -934,6 +945,14 @@ EXPECTED_BASELINE_FAILURES: tuple[str, ...] = (
     # native qwen family fails this test even after the 038 baseline
     # (independent finding, see secondary-review.json).
     "OrderAndReplayTests.test_summary_text_family_variant",
+    # R6 x 038-a composed case (in R6DefinedLogprobsTests): the
+    # streamed-reasoning-prefix variant of the 200 incomplete SSE
+    # root case.  On the pre-038 baseline it fails at the early-
+    # receipt assertion like the other A tests (feature absent); on
+    # the pre-fix 038 candidate it additionally fails at the
+    # final-bytes assertion (R6 tail normalization absent); it passes
+    # only on the R6-fixed runtime.
+    "R6DefinedLogprobsTests.test_incomplete_sse_with_early_reasoning_logprobs_removed",
 )
 
 
@@ -1900,6 +1919,78 @@ def _failed_400_envelope() -> dict:
     }
 
 
+def _logprobs_matrix_envelope() -> dict:
+    """One recognized 200 incomplete envelope, single message item,
+    content parts exercising the value matrix at the defined
+    locations: absent, null, empty, populated, unexpected JSON type,
+    a non-answer (refusal) part, and a same-named user-metadata copy
+    that must survive."""
+    return {
+        "id": "resp_1",
+        "object": "response",
+        "status": "incomplete",
+        "error": None,
+        "usage": dict(_USAGE),
+        "output": [
+            {"type": "message", "id": "m_1", "status": "in_progress",
+             "role": "assistant",
+             "content": [
+                 _json_answer_part("prazen del, brez logprobs"),
+                 _json_answer_part("To je presenetliv zapisano.",
+                                   logprobs=None),
+                 _json_answer_part("To je presenetliv zapisano.",
+                                   logprobs=[]),
+                 _json_answer_part("To je presenetliv zapisano.",
+                                   logprobs=[{"token": "to",
+                                              "logprob": -0.5,
+                                              "start_index": 0,
+                                              "end_index": 2}]),
+                 _json_answer_part("To je presenetliv zapisano.",
+                                   logprobs="unexpected"),
+                 {"type": "refusal", "text": "zavrnjen odgovor"},
+                 _json_answer_part("To je presenetliv zapisano.",
+                                   metadata={"logprobs": [
+                                       {"token": "m"}]}),
+             ]},
+        ],
+    }
+
+
+def _terminal_logprobs_payloads(terminal_type: str) -> list[dict]:
+    """The observed order with an explicit NON-completed terminal
+    (``response.incomplete`` / ``response.failed``) whose envelope
+    itself carries the answer with defined logprobs, protected
+    reasoning, usage and faithful status/error fields."""
+    payloads = _stream_payloads(_CLEAN)[:-1]
+    response: dict = {
+        "id": "r_1",
+        "object": "response",
+        "status": ("incomplete"
+                   if terminal_type == "response.incomplete" else "failed"),
+        "usage": dict(_USAGE),
+        "error": None,
+        "output": [
+            {"type": "reasoning", "id": "rs_1", "status": "completed",
+             "summary": [],
+             "content": [{"type": "reasoning_text", "text": _REASONING}]},
+            {"type": "message", "id": "m_1", "status": "incomplete",
+             "role": "assistant", "output_index": 1,
+             "content": [{"type": "output_text", "text": _CLEAN,
+                          "content_index": 0,
+                          "logprobs": [{"token": "to",
+                                         "logprob": -0.25}]}]},
+        ],
+    }
+    if terminal_type == "response.incomplete":
+        response["incomplete_details"] = {"reason": "synthetic"}
+    else:
+        response["error"] = {"code": "synthetic", "message": "synthetic"}
+    payloads.append({"type": terminal_type,
+                     "sequence_number": len(payloads),
+                     "response": response})
+    return payloads
+
+
 class R6DefinedLogprobsTests(_ReasoningStreamingBase):
     """R6 remediation of the inherited PR43 gap (root actual-HTTP
     probes, receipts independent-{current,baseline}-metadata-edge-cases
@@ -1964,6 +2055,95 @@ class R6DefinedLogprobsTests(_ReasoningStreamingBase):
         self.assertNotIn(b"[DONE]", body)
         self.assertEqual(self.harness.review_calls(), 0)
 
+    def test_incomplete_sse_with_early_reasoning_logprobs_removed(self) -> None:
+        # The root case (a) WITH the streamed reasoning prefix: the
+        # observed-order stream (reasoning prefix held at the barrier)
+        # ends WITHOUT a completed terminal after the answer frames
+        # carry defined logprobs.  Two requirements compose here:
+        # the 038-a early prefix (EXPECTED_BASELINE_FAILURES member -
+        # baseline fails at the early-receipt assertion) and the R6
+        # unconditional removal on the non-completed tail (pre-fix
+        # candidate fails at the final-bytes assertion).  On the
+        # R6-fixed runtime both hold: reasoning streams early, the
+        # answer is withheld while the gate is held, the final bytes
+        # are the whole stream with defined logprobs removed only,
+        # metadata preserved, no terminal fabrication, zero review.
+        payloads = _stream_payloads(
+            _CLEAN,
+            answer_delta_extra={"logprobs": []},
+            answer_done_extra={"logprobs": [
+                {"token": "to", "logprob": -0.5,
+                 "start_index": 0, "end_index": 2}]},
+            part_extra={"logprobs": None,
+                        "metadata": {"logprobs": [{"token": "meta"}]}}
+        )[:-1]  # no completed terminal: semantically incomplete stream
+        cut = _prefix_cut(False) + 1
+        before = _render_stream(payloads[:cut])
+        after = _render_stream(payloads[cut:])
+        self.harness.upstream(
+            before=before, after=after, barrier=True,
+            inter_frame_sleep=0.004, barrier_timeout=4.0)
+        cap = _ClientCapture()
+        early = _early_exchange(self.harness, _contract_body_stream(), cap)
+        self.assertTrue(
+            early,
+            "no early reasoning delivery while upstream blocked: expected "
+            "pre-038 baseline failure (whole-body SSE buffering before "
+            "any emission); the R6 tail normalization cannot be observed "
+            "before the 038-a prefix exists")
+        # Pre-release observation: reasoning reached the client, the
+        # answer withheld.
+        snapshot = cap.pre_release_snapshot
+        self.assertIn(_CANARY, snapshot)
+        self.assertNotIn(b"response.output_text.delta", snapshot)
+        self.assertNotIn(b"response.output_text.done", snapshot)
+        self.assertNotIn(b"response.completed", snapshot)
+        self.assertNotIn(_CLEAN.encode(), snapshot)
+        self.assertIsNone(cap.error, f"client error: {cap.error!r}")
+        self.assertEqual(cap.status, 200)
+        # Final bytes: the complete 14-frame stream with defined
+        # logprobs removed only (two same-named metadata copies
+        # survive), answer text unchanged, no terminal fabrication.
+        self.assertEqual(cap.blob, _expected_final(payloads,
+                                                   strip_logprobs=True))
+        self.assertNotIn(b'"type":"response.completed"', cap.blob)
+        self.assertNotIn(b"[DONE]", cap.blob)
+        self.assertEqual(cap.blob.count(_CLEAN.encode()), 4)
+        self.assertEqual(cap.blob.count(b'"logprobs"'), 2)
+        self.assertEqual(self.harness.review_calls(), 0)
+
+    def test_incomplete_terminal_event_logprobs_removed_faithful(self) -> None:
+        self._terminal_logprobs_case("response.incomplete")
+
+    def test_failed_terminal_event_logprobs_removed_faithful(self) -> None:
+        self._terminal_logprobs_case("response.failed")
+
+    def _terminal_logprobs_case(self, terminal_type: str) -> None:
+        # A complete stream whose explicit terminal is NOT completed
+        # (incomplete/failed) and whose terminal envelope itself
+        # carries the answer with defined logprobs: removal at the
+        # envelope's defined locations only; the terminal type,
+        # status, error/incomplete_details, usage and the protected
+        # reasoning stay faithful; no completed fabrication; zero
+        # review of the failed/incomplete main.
+        payloads = _terminal_logprobs_payloads(terminal_type)
+        self.harness.upstream(before=_render_stream(payloads), after=b"")
+        status, body = _one_shot(self.harness.proxy_port,
+                                 _contract_body_stream())
+        self.assertEqual(status, 200)
+        self.assertEqual(body, _expected_final(payloads,
+                                               strip_logprobs=True))
+        # Faithful terminal: appears exactly once, no completed.
+        self.assertEqual(body.count(terminal_type.encode()), 1)
+        self.assertNotIn(b'"type":"response.completed"', body)
+        self.assertNotIn(b"[DONE]", body)
+        # Answer text and protected reasoning preserved in the
+        # terminal envelope; no defined logprobs survives anywhere.
+        self.assertIn(_CLEAN.encode(), body)
+        self.assertIn(_REASONING.encode(), body)
+        self.assertEqual(body.count(b'"logprobs"'), 0)
+        self.assertEqual(self.harness.review_calls(), 0)
+
     def test_incomplete_json_200_logprobs_removed_zero_review(self) -> None:
         # Root R6 case (b): 200 application/json recognized Responses
         # envelope with status "incomplete".  Not repair-eligible: the
@@ -1992,6 +2172,39 @@ class R6DefinedLogprobsTests(_ReasoningStreamingBase):
         self.assertEqual(body.count(b'"logprobs"'), 1)
         self.assertEqual(self.harness.review_calls(), 0)
 
+    def test_logprobs_value_matrix_json_preserves_same_named_metadata(self) -> None:
+        # Value matrix on one recognized 200 incomplete JSON envelope:
+        # absent / null / empty / populated / unexpected JSON type are
+        # ALL removed by key presence at the defined locations only;
+        # a refusal part and same-named user metadata are untouched;
+        # answer texts, status, usage and every other byte unchanged;
+        # zero review (non-eligible request, recognized fields).
+        envelope = _logprobs_matrix_envelope()
+        self.harness.upstream(before=_json_bytes(envelope), after=b"",
+                              content_type="application/json")
+        status, body = _one_shot(self.harness.proxy_port,
+                                 _contract_body(False, _USER_INPUT))
+        self.assertEqual(status, 200)
+        self.assertEqual(body, _expected_json_body(envelope))
+        parsed = json.loads(body)
+        self.assertEqual(parsed["status"], "incomplete")
+        content = parsed["output"][0]["content"]
+        for index in range(5):
+            self.assertNotIn(
+                "logprobs", content[index],
+                f"defined logprobs survived at part {index}: "
+                f"{content[index]!r}")
+        # Refusal part untouched; metadata copy preserved.
+        self.assertEqual(content[5]["type"], "refusal")
+        self.assertEqual(content[5]["text"], "zavrnjen odgovor")
+        self.assertEqual(content[6]["metadata"]["logprobs"], [{"token": "m"}])
+        self.assertEqual(body.count(b'"logprobs"'), 1)
+        # Answer texts preserved verbatim.
+        for index in range(1, 5):
+            self.assertEqual(content[index]["text"],
+                             "To je presenetliv zapisano.")
+        self.assertEqual(self.harness.review_calls(), 0)
+
     def test_non200_400_json_logprobs_removed_zero_review(self) -> None:
         # Root R6 case (c): 400 recognized Responses JSON error body.
         # The owner's unconditional policy reaches non-200
@@ -2016,6 +2229,33 @@ class R6DefinedLogprobsTests(_ReasoningStreamingBase):
         self.assertEqual(body.count(b'"logprobs"'), 1)
         self.assertEqual(self.harness.review_calls(), 0)
 
+    def test_completed_sse_zero_review_logprobs_still_removed(self) -> None:
+        # CONTROL (must pass on the baseline AND the fixed runtimes):
+        # a completed, zero-review stream keeps its existing
+        # unconditional defined-location removal.  The R6 gap is the
+        # NON-completed / non-200 representations; this pins that the
+        # completed path is unchanged by the R6 remediation (no
+        # weakened, no extended, removal).
+        payloads = _stream_payloads(
+            _CLEAN,
+            answer_delta_extra={"logprobs": []},
+            answer_done_extra={"logprobs": [
+                {"token": "to", "logprob": -0.5,
+                 "start_index": 0, "end_index": 2}]},
+            part_extra={"logprobs": None,
+                        "metadata": {"logprobs": [{"token": "meta"}]}})
+        source = _render_stream(payloads)
+        self.harness.upstream(before=source, after=b"")
+        status, body = _one_shot(self.harness.proxy_port,
+                                 _contract_body_stream())
+        self.assertEqual(status, 200)
+        self.assertEqual(body, _expected_final(payloads,
+                                               strip_logprobs=True))
+        self.assertIn(b'"type":"response.completed"', body)
+        # Three same-named metadata copies survive (part-done,
+        # item-done, completed envelope); no defined-location copy.
+        self.assertEqual(body.count(b'"logprobs"'), 3)
+        self.assertEqual(self.harness.review_calls(), 0)
 
 
 # R6 (inherited PR43 gap, NOT the 038-a feature): these are EXPECTED
@@ -2028,7 +2268,10 @@ class R6DefinedLogprobsTests(_ReasoningStreamingBase):
 # in EXPECTED_BASELINE_FAILURES.
 EXPECTED_R6_BASELINE_FAILURES: tuple[str, ...] = (
     "R6DefinedLogprobsTests.test_incomplete_sse_answer_logprobs_removed_zero_review",
+    "R6DefinedLogprobsTests.test_incomplete_terminal_event_logprobs_removed_faithful",
+    "R6DefinedLogprobsTests.test_failed_terminal_event_logprobs_removed_faithful",
     "R6DefinedLogprobsTests.test_incomplete_json_200_logprobs_removed_zero_review",
+    "R6DefinedLogprobsTests.test_logprobs_value_matrix_json_preserves_same_named_metadata",
     "R6DefinedLogprobsTests.test_non200_400_json_logprobs_removed_zero_review",
 )
 
