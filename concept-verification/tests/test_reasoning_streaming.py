@@ -542,7 +542,8 @@ class _ReasoningHarness:
                  inter_frame_sleep: float = 0.0,
                  barrier_timeout: float = 4.0,
                  pre_after_sleep: float = 0.0,
-                 truncated_after: int | None = None) -> threading.Event:
+                 truncated_after: int | None = None,
+                 content_type: str = "text/event-stream") -> threading.Event:
         _StreamUpstream.before = before
         _StreamUpstream.after = after
         _StreamUpstream.chunk = chunk
@@ -552,7 +553,7 @@ class _ReasoningHarness:
         _StreamUpstream.truncated_after = truncated_after
         _StreamUpstream.send_content_length = True
         _StreamUpstream.status = 200
-        _StreamUpstream.content_type = "text/event-stream"
+        _StreamUpstream.content_type = content_type
         _StreamUpstream.barrier_entered = threading.Event()
         _StreamUpstream.barrier_entered_at = None
         if barrier:
@@ -562,7 +563,11 @@ class _ReasoningHarness:
         return threading.Event()
 
     def upstream_500(self, body: bytes = b'{"error":{"code":"synthetic"}}') -> None:
-        _StreamUpstream.status = 500
+        self.upstream_status(500, body)
+
+    def upstream_status(self, status: int, body: bytes) -> None:
+        """Non-200 upstream response with a fixed JSON body (R6)."""
+        _StreamUpstream.status = status
         _StreamUpstream.error_body = body
         _StreamUpstream.before = b""
         _StreamUpstream.after = b""
@@ -1328,7 +1333,8 @@ def _expected_final(payloads: list[dict], new_answer: str | None = None,
                         del part["logprobs"]
                     if new_answer is not None and isinstance(part, dict):
                         part["text"] = new_answer
-        elif event_type == "response.completed":
+        elif event_type in ("response.completed", "response.incomplete",
+                            "response.failed"):
             response = value.get("response")
             if isinstance(response, dict):
                 for item in response.get("output", []):
@@ -1345,6 +1351,27 @@ def _expected_final(payloads: list[dict], new_answer: str | None = None,
                             del part["logprobs"]
                         if new_answer is not None and isinstance(part, dict):
                             part["text"] = new_answer
+                if event_type != "response.completed" and strip_logprobs:
+                    # Explicit terminal envelopes (incomplete/failed):
+                    # defined-location removal computed INDEPENDENTLY of
+                    # the runtime: the documented Responses object shape
+                    # is output[] message items -> content[] output_text
+                    # parts, removed by key presence only.  Same-named
+                    # user metadata and protected reasoning are untouched;
+                    # the terminal itself and its status/error/finish
+                    # fields stay faithful.
+                    for item in response.get("output", []):
+                        if not isinstance(item, dict) \
+                                or item.get("type") != "message":
+                            continue
+                        content = item.get("content")
+                        if not isinstance(content, list):
+                            continue
+                        for part in content:
+                            if isinstance(part, dict) \
+                                    and part.get("type") == "output_text" \
+                                    and "logprobs" in part:
+                                del part["logprobs"]
         expected.append(_frame(value))
     return b"".join(expected)
 
@@ -1768,6 +1795,242 @@ class LogprobsAndMetadataTests(_ReasoningStreamingBase):
         self.assertIn(
             b'"metadata":{"logprobs":[{"token":"meta"}]}', body)
         self.assertEqual(self.harness.review_calls(), 0)
+
+
+# ---------------------------------------------------------------------------
+# R6 (owner unconditional logprobs policy; inherited PR43 gap): defined
+# location removal must reach every recognized Responses
+# representation - 200 incomplete SSE (with or without an
+# already-streamed reasoning prefix), complete-but-incomplete/failed
+# terminals, 200 incomplete JSON, non-200 JSON, and the value matrix -
+# independently of repair eligibility, while same-named user
+# metadata, protected reasoning, answer text, status, usage and error
+# semantics stay untouched.  Expected values are derived INDEPENDENTLY
+# of the runtime: the fixture text minus the defined keys (documented
+# compact-JSON wire form only); no runtime normalizer is imported.
+# ---------------------------------------------------------------------------
+def _json_bytes(obj: dict) -> bytes:
+    """Canonical compact-JSON wire form (the documented serialization
+    shared by the SSE data frames and the proxy re-rendering)."""
+    return json.dumps(obj, ensure_ascii=False,
+                      separators=(",", ":")).encode("utf-8")
+
+
+def _json_answer_part(text: str, **extra: object) -> dict:
+    part = {"type": "output_text", "text": text, "content_index": 0}
+    part.update(extra)
+    return part
+
+
+def _strip_defined_logprobs_expected(envelope: dict) -> dict:
+    """INDEPENDENT expectation of the documented defined locations in
+    one recognized Responses JSON envelope: output[] message items ->
+    content[] output_text parts, removed by key presence only.  No
+    recursion into metadata, tool data or user containers; same-named
+    user metadata is preserved."""
+    import copy
+
+    value = copy.deepcopy(envelope)
+    output = value.get("output")
+    if not isinstance(output, list):
+        return value
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if (isinstance(part, dict) and part.get("type") == "output_text"
+                    and "logprobs" in part):
+                del part["logprobs"]
+    return value
+
+
+def _expected_json_body(envelope: dict) -> bytes:
+    """Documented wire expectation for a recognized Responses JSON
+    envelope: only the defined locations lose the logprobs key; every
+    other byte is identical to the source text."""
+    return _json_bytes(_strip_defined_logprobs_expected(envelope))
+
+
+def _incomplete_json_envelope() -> dict:
+    """Recognized Responses object, framing-complete but semantically
+    incomplete (status != completed, error null): not repair-eligible,
+    with defined answer logprobs plus a same-named user-metadata copy."""
+    return {
+        "id": "resp_1",
+        "object": "response",
+        "status": "incomplete",
+        "error": None,
+        "created_at": 1765785600,
+        "usage": dict(_USAGE),
+        "output": [
+            {"type": "reasoning", "id": "rs_1", "status": "completed",
+             "summary": [],
+             "content": [{"type": "reasoning_text", "text": _REASONING}]},
+            {"type": "message", "id": "m_1", "status": "in_progress",
+             "role": "assistant",
+             "content": [_json_answer_part(
+                 "To je presenetliv zapisano.",
+                 logprobs=[{"token": "to", "logprob": -0.25}],
+                 metadata={"logprobs": [{"token": "meta"}]})]},
+        ],
+    }
+
+
+def _failed_400_envelope() -> dict:
+    """Recognized Responses JSON error body (the 400 root case):
+    status failed with a provider error object; defined logprobs at
+    both value forms plus a same-named user-metadata copy."""
+    return {
+        "id": "resp_1",
+        "object": "response",
+        "status": "failed",
+        "error": {"code": "synthetic_upstream", "message": "synthetic"},
+        "usage": dict(_USAGE),
+        "output": [
+            {"type": "message", "id": "m_1", "status": "incomplete",
+             "role": "assistant",
+             "content": [_json_answer_part(
+                 "To je presenetliv zapisano.",
+                 logprobs=None,
+                 metadata={"logprobs": None})]},
+        ],
+    }
+
+
+class R6DefinedLogprobsTests(_ReasoningStreamingBase):
+    """R6 remediation of the inherited PR43 gap (root actual-HTTP
+    probes, receipts independent-{current,baseline}-metadata-edge-cases
+    -v1): defined API logprobs were retained on 200 incomplete SSE
+    (the root probe stream carried a streamed reasoning prefix), 200
+    incomplete JSON and 400 recognized JSON, all with zero review.
+    These tests pin the owner policy at the actual HTTP boundary:
+    unconditional defined-location removal, same-named user metadata
+    and all other fields preserved, answer/status/usage/error
+    unchanged, zero review.  The SSE root case below is the minimal
+    incomplete stream (lifecycle + message frames, no reasoning
+    prefix and no terminal); the with-reasoning-prefix variant with
+    the barrier early-receipt proof and the explicit incomplete/
+    failed terminal, value-matrix and completed-control variants are
+    follow-up extensions of this section."""
+
+    def test_incomplete_sse_answer_logprobs_removed_zero_review(self) -> None:
+        # Root R6 case (a): 200 SSE, framing-complete but
+        # semantically incomplete (no terminal event) after the answer
+        # frames.  Defined answer logprobs removed at every copy;
+        # same-named user metadata preserved; answer text unchanged;
+        # no completed/[DONE] fabrication; zero review of the
+        # incomplete main.
+        payloads = [
+            _created(0),
+            _in_progress(1),
+            _message_item_added(2),
+            _answer_part_added(3),
+            _answer_delta(4, _ANSWER, logprobs=[]),
+            _answer_done(5, _ANSWER, logprobs=[
+                {"token": "to", "logprob": -0.5,
+                 "start_index": 0, "end_index": 2}]),
+            _answer_part_done(6, _ANSWER,
+                              part_extra={"logprobs": None,
+                                          "metadata": {"logprobs": [
+                                              {"token": "meta"}]}}),
+            _message_item_done(7, _ANSWER,
+                               part_extra={"logprobs": "unexpected",
+                                           "metadata": {"logprobs": [
+                                               {"token": "meta"}]}}),
+        ]
+        source = _render_stream(payloads)
+        self.harness.upstream(before=source, after=b"")
+        status, body = _one_shot(self.harness.proxy_port,
+                                 _contract_body_stream())
+        self.assertEqual(status, 200)
+        self.assertEqual(body, _expected_final(payloads,
+                                               strip_logprobs=True))
+        # Answer text unchanged at every copy (four answer frames).
+        self.assertEqual(body.count(_ANSWER.encode()), 4)
+        # No defined-location value form survives; only the two
+        # same-named user-metadata copies keep the key.
+        self.assertNotIn(b'"logprobs":null', body)
+        self.assertNotIn(b'"logprobs":"unexpected"', body)
+        self.assertNotIn(b'"logprobs":[]', body)
+        self.assertNotIn(
+            b'"logprobs":[{"token":"to","logprob":-0.5,"start_index":0,'
+            b'"end_index":2}]', body)
+        self.assertEqual(body.count(b'"logprobs"'), 2)
+        # No terminal fabrication; no review.
+        self.assertNotIn(b'"type":"response.completed"', body)
+        self.assertNotIn(b"[DONE]", body)
+        self.assertEqual(self.harness.review_calls(), 0)
+
+    def test_incomplete_json_200_logprobs_removed_zero_review(self) -> None:
+        # Root R6 case (b): 200 application/json recognized Responses
+        # envelope with status "incomplete".  Not repair-eligible: the
+        # unconditional defined-location removal still applies, with
+        # status/error/usage/answer text and the same-named user
+        # metadata preserved and zero review calls.
+        envelope = _incomplete_json_envelope()
+        self.harness.upstream(before=_json_bytes(envelope), after=b"",
+                              content_type="application/json")
+        status, body = _one_shot(self.harness.proxy_port,
+                                 _contract_body(False, _USER_INPUT))
+        self.assertEqual(status, 200)
+        self.assertEqual(body, _expected_json_body(envelope))
+        parsed = json.loads(body)
+        self.assertEqual(parsed["status"], "incomplete")
+        self.assertIsNone(parsed["error"])
+        self.assertEqual(parsed["usage"], _USAGE)
+        part = parsed["output"][1]["content"][0]
+        self.assertEqual(part["text"], "To je presenetliv zapisano.")
+        self.assertNotIn("logprobs", part)
+        # Same-named user metadata preserved verbatim.
+        self.assertEqual(part["metadata"]["logprobs"], [{"token": "meta"}])
+        # The reasoning item is protected: byte-identical.
+        self.assertEqual(parsed["output"][0],
+                         _incomplete_json_envelope()["output"][0])
+        self.assertEqual(body.count(b'"logprobs"'), 1)
+        self.assertEqual(self.harness.review_calls(), 0)
+
+    def test_non200_400_json_logprobs_removed_zero_review(self) -> None:
+        # Root R6 case (c): 400 recognized Responses JSON error body.
+        # The owner's unconditional policy reaches non-200
+        # representations too: defined logprobs removed, faithful 400
+        # status and error object, same-named user metadata preserved,
+        # zero review, no repair attempt.
+        envelope = _failed_400_envelope()
+        self.harness.upstream_status(400, _json_bytes(envelope))
+        status, body = _one_shot(self.harness.proxy_port,
+                                 _contract_body(False, _USER_INPUT))
+        self.assertEqual(status, 400)
+        self.assertEqual(body, _expected_json_body(envelope))
+        parsed = json.loads(body)
+        self.assertEqual(parsed["status"], "failed")
+        self.assertEqual(parsed["error"]["code"], "synthetic_upstream")
+        part = parsed["output"][0]["content"][0]
+        self.assertEqual(part["text"], "To je presenetliv zapisano.")
+        self.assertNotIn("logprobs", part)
+        # Same-named user metadata preserved (declared null here).
+        self.assertIn("logprobs", part["metadata"])
+        self.assertIsNone(part["metadata"]["logprobs"])
+        self.assertEqual(body.count(b'"logprobs"'), 1)
+        self.assertEqual(self.harness.review_calls(), 0)
+
+
+
+# R6 (inherited PR43 gap, NOT the 038-a feature): these are EXPECTED
+# TO FAIL on the pre-038 baseline AND on the pre-fix 038 candidate,
+# because the unconditional defined-location logprobs removal never
+# applied to non-completed / non-200 recognized representations
+# (root probes: defined logprobs retained, zero review, on both the
+# accepted base 8c1a24f and the pre-fix candidate).  They must pass
+# on the R6-fixed runtime.  Kept distinct from the 038-a feature set
+# in EXPECTED_BASELINE_FAILURES.
+EXPECTED_R6_BASELINE_FAILURES: tuple[str, ...] = (
+    "R6DefinedLogprobsTests.test_incomplete_sse_answer_logprobs_removed_zero_review",
+    "R6DefinedLogprobsTests.test_incomplete_json_200_logprobs_removed_zero_review",
+    "R6DefinedLogprobsTests.test_non200_400_json_logprobs_removed_zero_review",
+)
 
 
 # ---------------------------------------------------------------------------
