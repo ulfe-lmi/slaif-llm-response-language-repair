@@ -54,6 +54,11 @@ LIFECYCLE_NONTERMINAL_EVENT_TYPES = frozenset(
     {"response.created", "response.queued", "response.in_progress"}
 )
 
+# Known nonterminal response.status values a lifecycle prefix snapshot
+# may carry when the field is present (validated nonterminal prefix,
+# order 038-a R1).
+LIFECYCLE_NONTERMINAL_STATUSES = frozenset({"queued", "in_progress"})
+
 # Reasoning event spellings evidenced by the documented Responses
 # stream, the frozen synthetic Qwen fixtures, and the observed
 # qwen3.8-27b-rtx3090 traces: reasoning arrives as output items of
@@ -222,12 +227,23 @@ def _valid_reasoning_item(item: object) -> bool:
 
 def _lifecycle_denial_reason(response: object) -> str | None:
     """Denial reason for a lifecycle snapshot, or None when the
-    snapshot is explicitly proven reasoning-only (its output list
-    holds only proven reasoning items; an empty list proves nothing
-    answer-bearing is carried).  A missing response object or output
-    list is not proven empty and therefore buffers."""
+    snapshot is explicitly proven answer-free: a PRESENT status must
+    be a known nonterminal response status (queued/in_progress), so
+    terminal, unknown, wrong-type and present-null statuses are
+    denied; present non-null error/incomplete_details are denied; and
+    the output list holds only proven reasoning items (an empty list
+    proves nothing answer-bearing is carried).  Absent fields keep the
+    existing compatibility.  A missing response object or output list
+    is not proven empty and therefore buffers."""
     if not isinstance(response, dict):
         return "lifecycle snapshot unproven"
+    if "status" in response:
+        status = response["status"]
+        if type(status) is not str or status not in LIFECYCLE_NONTERMINAL_STATUSES:
+            return "lifecycle terminal or unknown status"
+    for key in ("error", "incomplete_details"):
+        if response.get(key) is not None:
+            return f"lifecycle snapshot carries {key}"
     output = response.get("output")
     if not isinstance(output, list):
         return "lifecycle snapshot unproven"

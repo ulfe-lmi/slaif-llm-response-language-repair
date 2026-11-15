@@ -113,6 +113,50 @@ class TestLifecycleSnapshot(unittest.TestCase):
         d = _decision(self._lifecycle("response.created", _RESPONSE))
         self.assertEqual((d.kind, d.reason), ("prefix", "lifecycle no-answer-payload"))
 
+    def test_terminal_status_boundary(self):
+        # R1: a PRESENT status must be a known nonterminal response
+        # status; terminal statuses are denied even with empty output.
+        for status in ("completed", "failed", "incomplete", "cancelled"):
+            with self.subTest(status=status):
+                d = _decision(self._lifecycle("response.created", {"object": "response", "status": status, "output": []}))
+                self.assertEqual((d.kind, d.reason), ("boundary", "lifecycle terminal or unknown status"))
+
+    def test_unknown_wrongtype_and_null_status_boundary(self):
+        for status in ("mystery", 123, None, ["in_progress"]):
+            with self.subTest(status=status):
+                d = _decision(self._lifecycle("response.created", {"object": "response", "status": status, "output": []}))
+                self.assertEqual((d.kind, d.reason), ("boundary", "lifecycle terminal or unknown status"))
+
+    def test_known_nonterminal_status_prefix(self):
+        for status in ("queued", "in_progress"):
+            with self.subTest(status=status):
+                d = _decision(self._lifecycle("response.created", {"object": "response", "status": status, "output": []}))
+                self.assertEqual((d.kind, d.reason), ("prefix", "lifecycle no-answer-payload"))
+
+    def test_absent_status_compatibility_prefix(self):
+        d = _decision(self._lifecycle("response.created", {"object": "response", "output": []}))
+        self.assertEqual((d.kind, d.reason), ("prefix", "lifecycle no-answer-payload"))
+
+    def test_present_error_boundary(self):
+        d = _decision(self._lifecycle("response.created", {"object": "response", "status": "in_progress", "error": {"code": "x"}, "output": []}))
+        self.assertEqual((d.kind, d.reason), ("boundary", "lifecycle snapshot carries error"))
+
+    def test_present_incomplete_details_boundary(self):
+        d = _decision(self._lifecycle("response.created", {"object": "response", "status": "in_progress", "incomplete_details": {"reason": "max_output_tokens"}, "output": []}))
+        self.assertEqual((d.kind, d.reason), ("boundary", "lifecycle snapshot carries incomplete_details"))
+
+    def test_null_error_and_incomplete_details_compatibility_prefix(self):
+        d = _decision(self._lifecycle("response.created", {"object": "response", "status": "in_progress", "error": None, "incomplete_details": None, "output": []}))
+        self.assertEqual((d.kind, d.reason), ("prefix", "lifecycle no-answer-payload"))
+
+    def test_completed_reasoning_item_in_snapshot_still_prefix(self):
+        # The item object's own status is a different object: a
+        # completed reasoning item inside a nonterminal snapshot is
+        # still proven reasoning-only.
+        done_item = dict(_REASONING_ITEM, status="completed")
+        d = _decision(self._lifecycle("response.in_progress", {"object": "response", "status": "in_progress", "output": [done_item]}))
+        self.assertEqual((d.kind, d.reason), ("prefix", "lifecycle no-answer-payload"))
+
     def test_reasoning_item_snapshot_proven(self):
         response = dict(_RESPONSE, output=[dict(_REASONING_ITEM)])
         self.assertEqual(_decision(self._lifecycle("response.in_progress", response)).kind, "prefix")
@@ -280,6 +324,13 @@ class TestEmbeddedCarriers(unittest.TestCase):
     def test_malformed_embedded_response_structure_buffers(self):
         # Wellformed JSON, malformed structure: output is not a list.
         d = _decision(_frame("response.reasoning_text.delta", {"type": "response.reasoning_text.delta", "item_id": "rs_1", "delta": "t", "response": {"object": "response", "output": "nope"}}))
+        self.assertEqual((d.kind, d.reason), ("boundary", "embedded response unproven"))
+
+    def test_embedded_terminal_status_response_buffers(self):
+        # The same snapshot validator covers the embedded response
+        # carrier: a terminal status forces the boundary even with an
+        # empty output list.
+        d = _decision(_frame("response.reasoning_text.delta", {"type": "response.reasoning_text.delta", "item_id": "rs_1", "delta": "t", "response": {"object": "response", "status": "completed", "output": []}}))
         self.assertEqual((d.kind, d.reason), ("boundary", "embedded response unproven"))
 
     def test_proven_reasoning_carriers_still_prefix(self):
