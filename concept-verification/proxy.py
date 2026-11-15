@@ -30,6 +30,7 @@ import header_transport
 import passthrough
 import request_admission
 import request_lifecycle
+import sse_streaming
 import upstream_setup
 from batch_review import (
     BOUND_REVIEW_REASONS,
@@ -233,7 +234,9 @@ def _render_event(block: str, value: dict[str, object]) -> str:
 _UNSET: object = object()
 
 
-def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool]:
+def transform_sse_blocks(
+    raw: bytes, repair: Callable[[str], str]
+) -> tuple[list[str], bool]:
     """Repair one unambiguously identified assistant text answer only.
 
     Ownership is prefetched across the whole completed upstream SSE before
@@ -271,47 +274,33 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
     whole stream ineligible before dispatch (order 015-a, requirements 4
     and 5).  When the review accepts no text edit the raw bytes are
     returned unchanged (order 014-a requirement 7).
+
+    Returns the per-block rendered strings (each block plus its
+    delimiter, in stream order) and whether the answer was repaired;
+    the public transform_sse joins and encodes them, so the two never
+    diverge and the early-reasoning streaming prefix can validate the
+    blocks it already sent against this exact per-block output
+    (order 038-a R1).
     """
     blocks = _split_sse(raw)
     parsed: list[dict[str, object] | None] = [_event(block) for block, _ in blocks]
 
     # Order 035-c: always remove defined logprobs from all SSE event
     # locations before any eligibility/repair logic (by key presence,
-    # regardless of value/type; no recursive user-data scan).
-    logprobs_modified: set[int] = set()
-    for _idx, _val in enumerate(parsed):
-        if _val is None:
-            continue
-        _et = _val.get("type")
-        if _et in ("response.output_text.delta", "response.output_text.done"):
-            if "logprobs" in _val:
-                del _val["logprobs"]
-                logprobs_modified.add(_idx)
-        elif _et in ("response.content_part.added", "response.content_part.done"):
-            _p = _val.get("part")
-            if isinstance(_p, dict) and _p.get("type") == "output_text" and "logprobs" in _p:
-                del _p["logprobs"]
-                logprobs_modified.add(_idx)
-        elif _et in ("response.output_item.added", "response.output_item.done"):
-            _it = _val.get("item")
-            if isinstance(_it, dict) and _it.get("type") == "message":
-                _ct = _it.get("content")
-                if isinstance(_ct, list):
-                    for _pp in _ct:
-                        if (isinstance(_pp, dict) and _pp.get("type") == "output_text"
-                                and "logprobs" in _pp):
-                            del _pp["logprobs"]
-                            logprobs_modified.add(_idx)
-        elif _et in ("response.created", "response.in_progress", "response.completed",
-                     "response.incomplete", "response.failed", "response.queued"):
-            _resp = _val.get("response")
-            if isinstance(_resp, dict) and remove_defined_logprobs(_resp):
-                logprobs_modified.add(_idx)
+    # regardless of value/type; no recursive user-data scan).  The
+    # shared sse_streaming helper applies exactly the defined
+    # locations, so the whole-body transform and the streaming prefix
+    # path strip identically frame by frame (order 038-a R1).
+    logprobs_modified: set[int] = {
+        _idx
+        for _idx, _val in enumerate(parsed)
+        if _val is not None and sse_streaming.strip_event_logprobs(_val)
+    }
 
-    def _bypass() -> tuple[bytes, bool]:
-        """Return raw unchanged, or re-render only logprobs-removed events."""
+    def _bypass_parts() -> list[str]:
+        """Per-block raw, or re-render only logprobs-removed events."""
         if not logprobs_modified:
-            return raw, False
+            return [_blk + _delim for _blk, _delim in blocks]
         _parts: list[str] = []
         for (_blk, _delim), _v, _i in zip(blocks, parsed, range(len(blocks)), strict=True):
             if _v is None:
@@ -320,7 +309,7 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
             if _i in logprobs_modified:
                 _blk = _render_event(_blk, _v)
             _parts.append(_blk + _delim)
-        return "".join(_parts).encode("utf-8"), False
+        return _parts
 
     streams: dict[str, list[str]] = {}
     # Positions declared by the stream events themselves: text delta/done
@@ -402,7 +391,7 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
         # Answer-related events with missing, non-string or empty ids (or
         # unowned answer-shaped terminal copies) carry ambiguous ownership:
         # bypass unchanged with zero review calls.
-        return _bypass()
+        return _bypass_parts(), False
     # Completed-envelope answer units: every output_text part of any message
     # item in any response.output, with list ownership positions.
     # Output messages are identified by ``id`` (delta/done events carry
@@ -488,11 +477,11 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
     if non_empty:
         if len(non_empty) != 1:
             # Several assistant text answers: ambiguous ownership.
-            return _bypass()
+            return _bypass_parts(), False
         item_id = non_empty[0]
         if not answer_event_ids <= {item_id}:
             # An answer event for another id: ambiguous ownership.
-            return _bypass()
+            return _bypass_parts(), False
         joined = "".join(streams[item_id])
         # Exactly one confirming final assistant output_text with consistent
         # ownership is required before any repair call: the final message id
@@ -502,7 +491,7 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
         # units, wrong id, inconsistent indices, or mismatched text)
         # bypasses unchanged with zero calls.
         if len(units) != 1:
-            return _bypass()
+            return _bypass_parts(), False
         unit_index, output_pos, unit_item, content_pos, unit_part = units[0]
         message_id = unit_item.get("id")
         confirmed = (
@@ -515,7 +504,7 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
             and unit_part["text"] == joined
         )
         if not confirmed:
-            return _bypass()
+            return _bypass_parts(), False
         confirmed_id = item_id
         original_text = joined
     else:
@@ -525,7 +514,7 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
         if len(assistant_units) != 1 or len(units) != 1:
             # No unambiguous single assistant answer (several answers,
             # several content parts, or non-answer content): bypass.
-            return _bypass()
+            return _bypass_parts(), False
         unit_index, output_pos, unit_item, content_pos, unit_part = assistant_units[0]
         message_id = unit_item.get("id")
         if (
@@ -537,7 +526,7 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
             or not answer_event_ids <= {message_id}
         ):
             # Absent or inconsistent ownership: bypass unchanged.
-            return _bypass()
+            return _bypass_parts(), False
         confirmed_id = message_id
         original_text = str(unit_part["text"])
 
@@ -545,12 +534,12 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
         # The completed envelope confirming the single answer is not an
         # explicitly completed, error-free Responses object: bypass
         # unchanged with zero review calls.
-        return _bypass()
+        return _bypass_parts(), False
     if not aligned_metadata_clean(unit_part):
         # Non-empty (or non-list) aligned metadata on the final answer
         # part cannot be kept valid beside a changed answer: bypass
         # unchanged with zero review calls.
-        return _bypass()
+        return _bypass_parts(), False
 
     # Order 014-b requirement 2/3: before any reviewer side effect, every
     # answer-bearing terminal representation must be proved consistent with
@@ -566,7 +555,7 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
     if not isinstance(final_content, list):
         # Units are only collected from a list content above; this keeps the
         # preflight's typed boundary explicit.
-        return _bypass()
+        return _bypass_parts(), False
     final_kinds = [
         part.get("type") if isinstance(part, dict) else None for part in final_content
     ]
@@ -585,7 +574,7 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
                     # A token/offset aligned list on a delta of the
                     # confirmed answer becomes stale beside a changed
                     # answer: the whole stream abstains.
-                    return _bypass()
+                    return _bypass_parts(), False
                 delta_indices.add(index)
         elif event_type == "response.content_part.added":
             part = value.get("part")
@@ -597,11 +586,11 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
             # never rewritten, and non-empty initial content cannot be
             # proved safe, so it abstains raw unchanged with zero calls.
             if type(stream_id) is not str or stream_id != confirmed_id:
-                return _bypass()
+                return _bypass_parts(), False
             if "text" in part and part["text"] != "":
-                return _bypass()
+                return _bypass_parts(), False
             if not aligned_metadata_clean(part):
-                return _bypass()
+                return _bypass_parts(), False
         elif event_type == "response.output_item.added":
             item_obj = value.get("item")
             if not (isinstance(item_obj, dict) and item_obj.get("type") == "message"):
@@ -609,22 +598,22 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
                 continue
             obj_id = item_obj.get("id")
             if type(obj_id) is not str or obj_id != confirmed_id:
-                return _bypass()
+                return _bypass_parts(), False
             # The initial representation of the answer item must agree on
             # identity and role and carry supported empty placeholders only.
             if item_obj.get("role") != "assistant":
-                return _bypass()
+                return _bypass_parts(), False
             content = item_obj.get("content")
             if content is not None:
                 if not isinstance(content, list):
-                    return _bypass()
+                    return _bypass_parts(), False
                 for part in content:
                     if not isinstance(part, dict) or (
                         "text" in part and part["text"] != ""
                     ):
-                        return _bypass()
+                        return _bypass_parts(), False
                     if not aligned_metadata_clean(part):
-                        return _bypass()
+                        return _bypass_parts(), False
         elif event_type == "response.output_text.done":
             if type(stream_id) is not str or stream_id != confirmed_id:
                 continue
@@ -633,11 +622,11 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
                 # A terminal done event must carry the exact original
                 # answer text; a missing or different text cannot be
                 # proved consistent.
-                return _bypass()
+                return _bypass_parts(), False
             if not aligned_metadata_clean(value):
                 # Stale token/offset alignment on a terminal copy of the
                 # confirmed answer makes the whole stream ineligible.
-                return _bypass()
+                return _bypass_parts(), False
             editable[index] = ("done", None)
         elif event_type == "response.content_part.done":
             part = value.get("part")
@@ -648,12 +637,12 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
             # above; a missing or non-string id returned earlier.  Kept as
             # an explicit defense of the ownership rule.
             if type(stream_id) is not str or stream_id != confirmed_id:
-                return _bypass()
+                return _bypass_parts(), False
             copy_counts["content_part.done"] += 1
             if part.get("text") != original_text:
-                return _bypass()
+                return _bypass_parts(), False
             if not aligned_metadata_clean(part):
-                return _bypass()
+                return _bypass_parts(), False
             editable[index] = ("part", None)
         elif event_type == "response.output_item.done":
             item_obj = value.get("item")
@@ -663,32 +652,32 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
                 continue
             obj_id = item_obj.get("id")
             if type(obj_id) is not str or obj_id != confirmed_id:
-                return _bypass()
+                return _bypass_parts(), False
             copy_counts["output_item.done"] += 1
             if item_obj.get("role") != "assistant":
-                return _bypass()
+                return _bypass_parts(), False
             if "status" in item_obj and item_obj.get("status") != "completed":
-                return _bypass()
+                return _bypass_parts(), False
             content = item_obj.get("content")
             if not isinstance(content, list) or len(content) != len(final_content):
-                return _bypass()
+                return _bypass_parts(), False
             for part_pos, part in enumerate(content):
                 if not isinstance(part, dict) or part.get("type") != final_kinds[part_pos]:
-                    return _bypass()
+                    return _bypass_parts(), False
             if content[content_pos].get("text") != original_text:
-                return _bypass()
+                return _bypass_parts(), False
             if not aligned_metadata_clean(content[content_pos]):
-                return _bypass()
+                return _bypass_parts(), False
             editable[index] = ("item", content_pos)
     if any(count > 1 for count in copy_counts.values()):
         # Duplicated terminal representations of the one answer are
         # ambiguous: bypass unchanged with zero calls.
-        return _bypass()
+        return _bypass_parts(), False
 
     new_text = repair(original_text)
     if new_text == original_text:
         # No accepted text edit: the raw bytes are returned unchanged.
-        return _bypass()
+        return _bypass_parts(), False
 
     # The validated final unit (a shared reference into the parsed events)
     # carries the repaired text; the render pass re-emits exactly the
@@ -735,7 +724,30 @@ def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool
         if re_render:
             block = _render_event(block, value)
         output.append(block + delimiter)
-    return "".join(output).encode("utf-8"), True
+    return output, True
+
+
+def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool]:
+    """Public whole-body SSE transform: per-block output, joined and
+    UTF-8 encoded (byte-identical to the historical implementation).
+    """
+    parts, repaired = transform_sse_blocks(raw, repair)
+    return "".join(parts).encode("utf-8"), repaired
+
+
+def _sse_completed_ok(raw: bytes) -> bool:
+    """True iff the completed SSE carries at least one valid
+    response.completed envelope (the transform precheck).  Malformed
+    framing or JSON is not an eligible completed stream."""
+    try:
+        return any(
+            value.get("type") == "response.completed"
+            and isinstance(value.get("response"), dict)
+            and validate_completed_envelope(value["response"]) is not None
+            for _block, value in _events(raw)
+        )
+    except (ProxyError, ValueError, OverflowError, RecursionError):
+        return False
 
 
 def _strict_json_body(raw: bytes) -> dict[str, object]:
@@ -2044,12 +2056,7 @@ class _PassthroughHandler(_Handler):
             if media_type == "application/json":
                 if validate_completed_envelope(_strict_json_body(raw)) is None:
                     return raw
-            elif not any(
-                value.get("type") == "response.completed"
-                and isinstance(value.get("response"), dict)
-                and validate_completed_envelope(value["response"]) is not None
-                for _block, value in _events(raw)
-            ):
+            elif not _sse_completed_ok(raw):
                 return raw
         except (ProxyError, ValueError, OverflowError, RecursionError):
             return raw
@@ -2072,6 +2079,14 @@ class _PassthroughHandler(_Handler):
         guard: upstream_setup.SetupGuard | None = None
         scope: request_lifecycle.CancellationScope | None = None
         first_control: BaseException | None = None
+        # Cumulative ACTIVE client-write time of the prefix emission
+        # phase (order 038-a R5, G2 review): only real write/flush
+        # time counts - upstream and review waits are excluded - so a
+        # healthy slow client and a slow upstream are both allowed
+        # while a stalled client cannot hold the stream past the
+        # delivery budget.  Initialized here (before any fallible
+        # setup) so every cleanup path can read it.
+        prefix_write_spent = 0.0
         try:
             try:
                 path = passthrough.request_path(owner.upstream.path, self.path)
@@ -2121,9 +2136,159 @@ class _PassthroughHandler(_Handler):
             prefix = b""
             buffered = False
             transformed = False
+            streamed = False
             if inspect_answer:
                 chunks: list[bytes] = []
                 size = 0
+                sse = media_type == "text/event-stream"
+                # Early-reasoning streaming state (order 038-a R1):
+                # while the body is still being captured, each newly
+                # complete proven prefix frame is emitted to the
+                # client; the first unproven frame is the one-way
+                # buffer boundary.  The PR43 bounded read1 loop, its
+                # oversize raw fallback and the guard primitives are
+                # preserved (order 038-a R3, decision D0).
+                decoded = ""
+                pending = b""
+                sweep_dead = False
+                emitted_chars = 0
+                emitted_bytes = 0
+                boundary: int | None = None
+                boundary_ordinal = 0
+                sent_blocks: list[str] = []
+
+                def guard_client_phase(run: Callable[[], None]) -> None:
+                    """Run one client-emission phase (status/headers or
+                    one prefix frame) under the cumulative ACTIVE
+                    delivery budget (order 038-a R5, G2 review): each
+                    phase arms one owned guard with the REMAINING
+                    budget, so only real client write/flush time
+                    counts - upstream and review waits are excluded
+                    and never arm or extend the clock.  On expiry the
+                    guard shuts down only the captured client socket
+                    and a late or racing completion loses to
+                    expiration; the guard is released and actually
+                    joined on every path."""
+                    nonlocal prefix_write_spent
+                    remaining = owner.delivery_timeout - prefix_write_spent
+                    if remaining <= 0:
+                        raise ProxyError(
+                            "client prefix delivery budget exceeded"
+                        )
+                    guard = delivery_transport.DeliveryGuard(
+                        self.connection, remaining
+                    )
+                    started = time.monotonic()
+                    try:
+                        run()
+                        expired = guard.release()
+                    except BaseException:
+                        guard.release()
+                        raise
+                    finally:
+                        prefix_write_spent += time.monotonic() - started
+                    if expired:
+                        self.close_connection = True
+                        raise ProxyError(
+                            "client prefix delivery budget exceeded"
+                        )
+
+                def begin_streaming() -> None:
+                    """Send status and headers exactly once, before
+                    any prefix frame.  Validator headers are always
+                    excluded: the tail may be re-rendered."""
+                    nonlocal streamed
+                    assert response is not None
+                    self._emission_begun = True
+                    self.close_connection = True
+
+                    def send_headers() -> None:
+                        assert response is not None
+                        self.send_response_only(response.status, response.reason)
+                        excluded = (
+                            passthrough.hop_headers(response.headers)
+                            | {"content-length", "etag", "content-md5",
+                               "digest", "content-digest"}
+                        )
+                        for key, value in response.getheaders():
+                            if key.lower() not in excluded:
+                                self.send_header(key, value)
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+
+                    guard_client_phase(send_headers)
+                    streamed = True
+
+                def sweep_frames(frame_chunk: bytes) -> None:
+                    """Emit each newly complete proven prefix frame;
+                    record the first unproven frame as the boundary.
+                    Emission stops permanently on the boundary, on a
+                    mid-stream decode failure, or once the body is
+                    known oversized (raw fallback)."""
+                    nonlocal decoded, pending, sweep_dead
+                    nonlocal emitted_chars, emitted_bytes
+                    nonlocal boundary, boundary_ordinal
+                    if sweep_dead:
+                        return
+                    try:
+                        text, pending = capture_transport.utf8_split(
+                            pending + frame_chunk
+                        )
+                    except capture_transport.CaptureError:
+                        # Mid-stream encoding failure: stop emitting;
+                        # the whole-body outcome path decides below.
+                        sweep_dead = True
+                        return
+                    if text:
+                        decoded += text
+                    if boundary is not None:
+                        sweep_dead = True
+                        return
+
+                    def emit_frame(block: str, delim: str) -> None:
+                        nonlocal emitted_bytes, boundary, boundary_ordinal
+                        if boundary is not None:
+                            return
+                        decision = sse_streaming.classify_prefix_frame(
+                            block, _event
+                        )
+                        if decision.kind != "prefix":
+                            # One-way boundary: this and every later
+                            # frame are buffered (no replay, no
+                            # reorder, no reclassification).
+                            boundary = emitted_bytes
+                            boundary_ordinal = len(sent_blocks)
+                            return
+                        if not streamed:
+                            begin_streaming()
+                        if decision.value is not None:
+                            stripped = sse_streaming.strip_event_logprobs(
+                                decision.value
+                            )
+                            rendered = (
+                                _render_event(block, decision.value)
+                                if stripped
+                                else block
+                            ) + delim
+                        else:
+                            rendered = block + delim
+                        sent_blocks.append(rendered)
+                        frame_bytes = rendered.encode("utf-8")
+                        guard_client_phase(
+                            lambda: (self.wfile.write(frame_bytes),
+                                     self.wfile.flush())
+                        )
+                        emitted_bytes += len((block + delim).encode("utf-8"))
+
+                    # Only the not-yet-emitted suffix is scanned, so
+                    # frame delivery is once-only and in stream order.
+                    suffix = decoded[emitted_chars:]
+                    emitted_chars += sse_streaming.emit_new_frames(
+                        suffix, 0, emit_frame
+                    )
+                    if boundary is not None:
+                        sweep_dead = True
+
                 while size <= MAIN_BODY_MAX_BYTES:
                     scope.raise_if_cancelled()
                     chunk = response.read1(min(65536, MAIN_BODY_MAX_BYTES + 1 - size))
@@ -2134,11 +2299,104 @@ class _PassthroughHandler(_Handler):
                         break
                     chunks.append(chunk)
                     size += len(chunk)
+                    if sse:
+                        sweep_frames(chunk)
+                        if size > MAIN_BODY_MAX_BYTES:
+                            # The PR43 oversize fallback decides
+                            # below; no further frame may be emitted.
+                            sweep_dead = True
                 prefix = b"".join(chunks)
                 if buffered:
                     if guard.release():
                         raise ProxyError("upstream body deadline expired")
                     guard = None
+                if sse and streamed:
+                    # Streaming outcome: status and the proven prefix
+                    # frames are already with the client; only the
+                    # tail is decided here, then delivered under one
+                    # fresh delivery deadline.
+                    scope.raise_if_cancelled()
+                    live = not buffered
+                    tail: bytes | None
+                    if not buffered:
+                        # PR43 oversize fallback preserved: no
+                        # repair, raw continuation from the first
+                        # unsent byte (zero review).
+                        tail = prefix[emitted_bytes:]
+                    elif boundary is None:
+                        # Frames but no boundary (no terminal, no
+                        # answer frame): nothing more is sent and no
+                        # completion is fabricated.
+                        tail = None
+                    else:
+                        scope.raise_if_cancelled()
+                        if _sse_completed_ok(prefix):
+                            owner.engine.begin_request(scope)
+                            try:
+                                blocks_out, _changed = transform_sse_blocks(
+                                    prefix, owner.engine.repair
+                                )
+                                # Ordinal validation: the sent prefix
+                                # must equal the transform's own
+                                # per-block output frame by frame
+                                # (frame identity/ordinal mapping, not
+                                # byte slicing; order 038-a R1).
+                                if blocks_out[:boundary_ordinal] != sent_blocks:
+                                    raise ProxyError(
+                                        "streaming prefix ordinal mismatch"
+                                    )
+                                tail = "".join(
+                                    blocks_out[boundary_ordinal:]
+                                ).encode("utf-8")
+                            except (
+                                ProxyError, ValueError, OverflowError, RecursionError
+                            ) as exc:
+                                owner.engine.abort_request(owner.observe_usage)
+                                if isinstance(exc, ProxyError):
+                                    tail = prefix[boundary:]
+                                else:
+                                    tail = None
+                            else:
+                                details = owner.engine.take_details()
+                                owner.write_traces(
+                                    uuid.uuid4().hex,
+                                    details,
+                                    time.monotonic() - started,
+                                )
+                                owner.observe_usage(details)
+                                owner.engine.mark_usage_observed()
+                                transformed = True
+                        else:
+                            # No valid completed envelope: the tail
+                            # passes through raw from the boundary.
+                            tail = prefix[boundary:]
+                    if tail is None:
+                        # Honest post-header failure: quiet close, no
+                        # second response, no fabricated completion.
+                        self.close_connection = True
+                        return
+                    scope.raise_if_cancelled()
+
+                    def emit_tail() -> None:
+                        assert response is not None
+                        self.wfile.write(tail)
+                        self.wfile.flush()
+                        if live:
+                            while True:
+                                scope.raise_if_cancelled()
+                                chunk = response.read1(65536)
+                                if not chunk:
+                                    if response.length not in (None, 0):
+                                        raise ProxyError(
+                                            "incomplete upstream body"
+                                        )
+                                    break
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+
+                    self._deliver(emit_tail)
+                    return
+                if buffered:
                     scope.raise_if_cancelled()
                     original = prefix
                     prefix = self._transform(prefix, media_type, scope, started)
