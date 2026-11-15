@@ -1,7 +1,7 @@
 # Compact architecture — rev 3
 
 Derived from root ARCHITECTURE 2.1, SHA-256
-`5caa7a116e600bdcad3a3ff569735bd12a9b5176876a71effe030dff074539c8`
+`2fb71ce6b210d1c1cc26f44d81f8e80b34d9be1ec0569e68b44e0748ed81f63c`
 (accepted base `8c1a24fe36a9e5e058fbca12ab1a0233ea134cf1`; pinned order
 038-a; prior revision in root §18.3). PLAN 1.0
 SHA-256 `d2aa1d98cc5177ac6093ab3aeb79903b192780910ef2d1712839b474fb5adbf0`

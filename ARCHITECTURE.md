@@ -308,7 +308,7 @@ this eligibility check — it never gates, enables or changes repair (§13).
 | --- | --- | --- | --- |
 | Admission | Queue full or 2 s wait deadline missed | fixed content-free `503` | none (before intake) |
 | Intake framing (strict) | Repeated `Content-Length` (even equal), comma lists, any `Transfer-Encoding`, any `Expect` | content-free `400` `REQUEST_FRAMING` + close | none |
-| Intake framing (strict) | Missing, nondecimal (including signed) or over-2,000,000-byte `Content-Length` | content-free `413` `REQUEST_LENGTH` + close | none |
+| Intake length (strict) | Missing, nondecimal (including signed) or over-2,000,000-byte `Content-Length` | content-free `413` + close (internal rejection reason `REQUEST_LENGTH`; no wire JSON code) | none |
 | Intake body (strict) | Fewer bytes delivered than advertised | `400` `REQUEST_BODY_INCOMPLETE` + close | none |
 | Intake framing (transparent) | Repeated `Content-Length` or `Transfer-Encoding`, combined `Content-Length` + `Transfer-Encoding`, comma, nondecimal or overlong `Content-Length`, non-`chunked` encoding, invalid chunk framing or trailers, fewer bytes delivered than advertised | content-free `400` `REQUEST_FRAMING_INVALID` | none |
 | Intake size (transparent) | Declared or chunk-decoded body over 256 MiB | content-free `413` `REQUEST_TOO_LARGE` | none |

@@ -21,7 +21,7 @@ total 10,000) stay as unmeasured planning values. Router/law/architecture/
 communication individual byte bounds remain 2,048/12,000/20,000/10,000 bytes.
 
 Full strategic core (PLAN, full ARCHITECTURE, strategic AGENTS, strategic
-communication, strategic init material, layout JSON): **146,112 bytes**, plus
+communication, strategic init material, layout JSON): **146,158 bytes**, plus
 roadmap, deliberate CRITICAL/reference reads and current state. No
 coding-size cap applies to strategy. The layout JSON is helper-read metadata,
 not a new mandatory full coding document.

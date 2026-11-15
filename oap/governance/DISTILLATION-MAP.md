@@ -3,7 +3,7 @@
 Revision 1. Reviewed against complete bundled sources after authoring. This is generator semantic review, not independent ICA or formal semantic proof. Hash/ID checks only establish structure. Full source revisions/hashes:
 
 - `PLAN.md`: `d2aa1d98cc5177ac6093ab3aeb79903b192780910ef2d1712839b474fb5adbf0`.
-- `ARCHITECTURE.md`: `5caa7a116e600bdcad3a3ff569735bd12a9b5176876a71effe030dff074539c8` (revision 2.1, authorized by pinned order 038-a; prior revision 2.0 in its §18.2 record).
+- `ARCHITECTURE.md`: `2fb71ce6b210d1c1cc26f44d81f8e80b34d9be1ec0569e68b44e0748ed81f63c` (revision 2.1, authorized by pinned order 038-a; prior revision 2.0 in its §18.2 record).
 - `oap/strategic-instructions/AGENTS.md`: `c08be7ea6f50ff218948e06ca942d40ce370b041f3580035a4f8ae8ef37c8221`.
 - `oap/strategic-instructions/OAP-COMMUNICATION-strategic.md`: `83c87a5277ca798609422927e47caa2babab2cf555824813cbbe7f4ac2531ea5`.
 - `docs/bootstrap/sources/concentrated-oap.md`: `9067c7e65f146b9fed19b903fd73e07f58d9b1163436761011a64702d14bf302` (immutable source revision 2.0 package).
