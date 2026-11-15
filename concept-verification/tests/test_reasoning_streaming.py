@@ -1037,18 +1037,12 @@ class LabelAndAmbiguityTests(_ReasoningStreamingBase):
             before=source[:start], after=source[start:],
             barrier=True, inter_frame_sleep=0.004, barrier_timeout=4.0)
         cap = _ClientCapture()
-        # Release is gated on the intended FINAL prefix marker (the full
-        # reasoning text, first delivered by the last pre-boundary
-        # frame), not on the first common canary: the client may see
-        # the canary in the first delta before the second (no-space)
-        # frame arrives, which would race the pre-release snapshot
-        # (followup review 4).  barrier_entered additionally proves the
-        # fake flushed its entire blocked section before the immutable
-        # snapshot; no sleep acts as a positive proof.
-        early = _early_exchange(
-            self.harness, _contract_body_stream(), cap,
-            release_marker=reasoning.encode(),
-            wait_barrier_entered=True)
+        # Release is gated on the first safe canary (delta 1): the
+        # second delta frame is itself the unsafe mismatch boundary, so
+        # on a correct runtime its text - and the full reasoning text
+        # - stays buffered; waiting for it can never succeed (followup
+        # review 5: the marker must not span the boundary).
+        early = _early_exchange(self.harness, _contract_body_stream(), cap)
         self.assertTrue(
             early,
             "no early reasoning delivery while upstream blocked: expected "
@@ -1120,7 +1114,16 @@ class LabelAndAmbiguityTests(_ReasoningStreamingBase):
             before=source[:start], after=source[start:],
             barrier=True, inter_frame_sleep=0.004, barrier_timeout=4.0)
         cap = _ClientCapture()
-        early = _early_exchange(self.harness, _contract_body_stream(), cap)
+        # Release is gated on the FINAL second-frame marker: del2,
+        # contained in the second (no-space) delta frame itself - NOT
+        # the concatenated text spanning the two JSON frames (followup
+        # review 5).  barrier_entered additionally proves the fake
+        # flushed its entire blocked section before the immutable
+        # snapshot; no sleep acts as a positive proof.
+        early = _early_exchange(
+            self.harness, _contract_body_stream(), cap,
+            release_marker=del2.encode(),
+            wait_barrier_entered=True)
         self.assertTrue(
             early,
             "no early reasoning delivery while upstream blocked: expected "
