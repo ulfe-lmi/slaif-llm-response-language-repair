@@ -41,6 +41,11 @@ class Upstream(BaseHTTPRequestHandler):
     content_type = "application/octet-stream"
     recorded: list[tuple[str, str, bytes, list[tuple[str, str]]]] = []
     stream_gate = None
+    # Test-fake sync (fixture only): set immediately AFTER the
+    # pre-gate slice is written + flushed and BEFORE the handler
+    # waits on stream_gate, so tests can prove the upstream already
+    # delivered that slice while still holding the continuation.
+    chunk_written = None
     content_length_override = None
     chunk_split = None
 
@@ -69,6 +74,8 @@ class Upstream(BaseHTTPRequestHandler):
                 )
                 self.wfile.write(self.source[:split])
                 self.wfile.flush()
+                if type(self).chunk_written is not None:
+                    type(self).chunk_written.set()
                 self.stream_gate.wait(5)
                 self.wfile.write(self.source[split:])
             else:
@@ -88,6 +95,7 @@ class PassthroughTests(unittest.TestCase):
         Upstream.content_type = "application/octet-stream"
         Upstream.recorded = []
         Upstream.stream_gate = None
+        Upstream.chunk_written = None
         Upstream.content_length_override = None
         Upstream.chunk_split = None
         _FakeUpstream.recorded = []
@@ -917,6 +925,202 @@ class LauncherSettingsTests(unittest.TestCase):
                 ):
                     proxy.main()
                 factory.assert_not_called()
+
+
+class R1BarrierRegressionTests(PassthroughTests):
+    """Order 038-a R1: primary-authored real-HTTP barrier regressions
+    (reusing the fixture, repair-eligible route store=False): a
+    contradictory lifecycle snapshot and an embedded response carrier
+    must each latch the one-way boundary.  Safe first-frame early
+    receipt is proven against the gated upstream, nothing forbidden
+    reaches the client while the gate is held, and the final
+    original order/text is delivered exactly once (clean answer:
+    zero review, byte-identical).  Both streams end at ``[DONE]``
+    with no valid completed envelope: a legitimate incomplete/
+    unsupported-tail shape (the eligible transparent path ends its
+    bounded read1 loop at the declared Content-Length, finds no
+    valid completion, and normalizes/delivers the retained tail with
+    zero review); the completed repair path is proven separately by
+    the existing integrated suite."""
+
+    @staticmethod
+    def _sse_frame(value: dict) -> bytes:
+        """One LF-delimited SSE data frame, compact JSON (the same
+        rendering the proxy uses when a frame is re-emitted)."""
+        return (
+            b"data: "
+            + json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            + b"\n\n"
+        )
+
+    def _run_gated_sse(self, frames: list[bytes], split: int) -> dict:
+        gate = threading.Event()
+        written = threading.Event()
+        Upstream.stream_gate = gate
+        Upstream.chunk_written = written
+        Upstream.chunk_split = split
+        Upstream.content_type = "text/event-stream"
+        Upstream.source = b"".join(frames)
+        result: dict = {}
+
+        def client() -> None:
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", self.proxy.server_port, timeout=10
+            )
+            # Repair-eligible route (store=False): the prefix
+            # classifier gates early delivery and the final answer
+            # goes through the review path.
+            conn.request(
+                "POST", "/v1/responses",
+                body=self.candidate(stream=True),
+            )
+            response = conn.getresponse()
+            result["status"] = response.status
+            progress = b""
+            while True:
+                chunk = response.read1(65536)
+                if not chunk:
+                    break
+                progress += chunk
+                result["progress"] = progress
+            conn.close()
+            result["body"] = progress
+
+        thread = threading.Thread(target=client, daemon=True)
+        thread.start()
+        return {"gate": gate, "written": written, "thread": thread, "result": result}
+
+    def _wait_for_prefix(self, run: dict, safe: bytes) -> None:
+        # Safe first-frame receipt while the upstream gate is held;
+        # startswith (not equality) so a single read carrying
+        # safe+forbidden bytes is caught by the exact held-prefix
+        # assertion, not reported as a missing safe frame.
+        deadline = time.monotonic() + 3
+        while not run["result"].get("progress", b"").startswith(safe):
+            if time.monotonic() >= deadline:
+                self.fail(
+                    "safe first frame not delivered early while the "
+                    "upstream gate was held"
+                )
+            time.sleep(0.01)
+
+    def _wait_held_window(self, run: dict, expected_held: bytes, seconds: float = 0.8) -> None:
+        # Exact held prefix for a short window before release: the
+        # client's held bytes must stay exactly ``expected_held``
+        # while the upstream still holds its continuation on the gate.
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            held = run["result"].get("progress", b"")
+            if held != expected_held:
+                self.fail(
+                    "forbidden early bytes or wrong held prefix "
+                    f"before release: {held[:160]!r} != {expected_held[:160]!r}"
+                )
+            time.sleep(0.02)
+        self.assertFalse(run["gate"].is_set())
+
+    def test_r1_contradictory_lifecycle_snapshot_one_way_boundary(self):
+        # Safe framing (an SSE comment) is delivered early first; the
+        # contradictory lifecycle snapshot behind it (PRESENT terminal
+        # status, empty output) is NOT a validated nonterminal prefix,
+        # and neither is the safe reasoning frame behind THAT in the
+        # same pre-gate slice: while the gate is held the client holds
+        # ONLY the comment.  After release the whole stream arrives
+        # once, in original order, the clean answer untouched
+        # (zero review).
+        comment = b": framing\n\n"
+        frame1 = self._sse_frame({
+            "type": "response.created",
+            "response": {"object": "response", "status": "completed", "output": []},
+        })
+        frame2 = self._sse_frame({
+            "type": "response.reasoning_part.added",
+            "part": {"type": "reasoning_text", "text": "mislim"},
+        })
+        frame3 = self._sse_frame(
+            {"type": "response.output_text.delta", "delta": _CLEAN_ANSWER})
+        frame4 = b"data: [DONE]\n\n"
+        run = self._run_gated_sse(
+            [comment, frame1, frame2, frame3, frame4],
+            split=len(comment) + len(frame1) + len(frame2),
+        )
+        try:
+            run["written"].wait(5)
+            self.assertTrue(run["written"].is_set())
+            # Upstream already delivered the whole pre-gate slice and
+            # holds the rest: prove the safe framing frame was
+            # received early...
+            self._wait_for_prefix(run, comment)
+            # ...and the exact held prefix is ONLY that safe frame:
+            # no contradictory snapshot, no later reasoning, no
+            # answer/terminal/review bytes.
+            self._wait_held_window(run, comment)
+            run["gate"].set()
+            run["thread"].join(10)
+            self.assertFalse(run["thread"].is_alive())
+            self.assertEqual(run["result"]["status"], 200)
+            # Final original order/text exactly once, no replay.
+            self.assertEqual(
+                run["result"]["body"],
+                comment + frame1 + frame2 + frame3 + frame4,
+            )
+            self.assert_no_review()
+        finally:
+            run["gate"].set()
+            run["thread"].join(5)
+
+    def test_r1_embedded_response_carrier_boundary_after_safe_prefix(self):
+        # The safe first frame (a proven reasoning part) is delivered
+        # early; the following reasoning delta embeds a response
+        # carrier with a PRESENT terminal status and empty output,
+        # and the next frame is a later safe reasoning delta - all
+        # three in the pre-gate slice.  The embedded carrier latches
+        # the one-way boundary: while the gate is held the client
+        # holds ONLY the safe first frame (no contradictory carrier,
+        # no later reasoning, no answer, no terminal, no review);
+        # after release the retained tail and remainder arrive once,
+        # original order, without replaying the sent prefix.
+        frame1 = self._sse_frame({
+            "type": "response.reasoning_part.added",
+            "part": {"type": "reasoning_text", "text": "mislim"},
+        })
+        frame2 = self._sse_frame({
+            "type": "response.reasoning_text.delta",
+            "item_id": "rs_1",
+            "delta": "razmišljam",
+            "response": {"object": "response", "status": "completed", "output": []},
+        })
+        frame3 = self._sse_frame({
+            "type": "response.reasoning_text.delta",
+            "item_id": "rs_1",
+            "delta": "dokončujem",
+        })
+        frame4 = self._sse_frame(
+            {"type": "response.output_text.delta", "delta": _CLEAN_ANSWER})
+        frame5 = b"data: [DONE]\n\n"
+        run = self._run_gated_sse(
+            [frame1, frame2, frame3, frame4, frame5],
+            split=len(frame1) + len(frame2) + len(frame3),
+        )
+        try:
+            run["written"].wait(5)
+            self.assertTrue(run["written"].is_set())
+            self._wait_for_prefix(run, frame1)
+            self._wait_held_window(run, frame1)
+            run["gate"].set()
+            run["thread"].join(10)
+            self.assertFalse(run["thread"].is_alive())
+            self.assertEqual(run["result"]["status"], 200)
+            # Final original order/text exactly once, no replay of the
+            # sent prefix.
+            self.assertEqual(
+                run["result"]["body"],
+                frame1 + frame2 + frame3 + frame4 + frame5,
+            )
+            self.assert_no_review()
+        finally:
+            run["gate"].set()
+            run["thread"].join(5)
 
 
 if __name__ == "__main__":
