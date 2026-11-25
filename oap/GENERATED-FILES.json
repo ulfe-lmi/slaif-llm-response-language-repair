@@ -16,14 +16,14 @@
    "sha256": "118be17b2e9e5b50d628c796b136ee1b8154ebf844af0007839f65848fd69f09"
   },
   "ARCHITECTURE-for-agents.md": {
-   "bytes": 19993,
+   "bytes": 20000,
    "class": "generated",
-   "sha256": "0d453224ad82948829e2bfea9381120fd0eaa41281afc0a5de99cdfff56ffd31"
+   "sha256": "e52d30b391c1a84b96c706c09803e06b81b5a140755e851b6c59db13bd001a17"
   },
   "ARCHITECTURE.md": {
-   "bytes": 53232,
+   "bytes": 56363,
    "class": "immutable",
-   "sha256": "2fb71ce6b210d1c1cc26f44d81f8e80b34d9be1ec0569e68b44e0748ed81f63c"
+   "sha256": "6a93315cdbc24cee9124b7c187c4757f5531f3ee65be453d0db0471f511a35db"
   },
   "CRITICAL.md": {
    "bytes": 10684,
@@ -423,17 +423,17 @@
   "oap/governance/CONTEXT-BUDGET.md": {
    "bytes": 1253,
    "class": "generated",
-   "sha256": "84b7190a3f7525eb09a6ee559f822a3168458da68130ac5d28baee58ef8c5e1f"
+   "sha256": "81eb59f5b2d718c9e16bf9b220833915014271cf7d90da30c6eae3df4eb7bf54"
   },
   "oap/governance/DISTILLATION-MAP.md": {
-   "bytes": 72455,
+   "bytes": 72670,
    "class": "generated",
-   "sha256": "2352a60133d7e71ca578919c580e4f0c6d1253945e6b6d2cc0d12aa26675611e"
+   "sha256": "aaa945c445640937a231eb8e236f60e0085a13fe4f9a0afcabda3c052ad5b927"
   },
   "oap/governance/MANIFEST.json": {
-   "bytes": 76502,
+   "bytes": 76717,
    "class": "generated",
-   "sha256": "62e8a95fbedd7eef3a015323fca911eb09be2bc815b28a49ff896b132759bb79"
+   "sha256": "1b0d3523c79ffec82772059139b45c81bfeab9f251ff496f34d73bf737abd490"
   },
   "oap/governance/WORKSPACE-LAYOUT.json": {
    "bytes": 1131,

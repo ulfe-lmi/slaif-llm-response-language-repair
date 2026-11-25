@@ -33,8 +33,8 @@ jobs:
       - name: Run bootstrap acceptance
         run: python3.12 -B -m unittest discover -s oap/tests -v
 
-      - name: Candidate governance review bound to order 038-a
-        run: python3.12 oap/bin/oap_cli.py candidate-review --repo-root . --order oap/orders/038-a-reasoning-streaming.md --order-sha256 c4f8425c8f5f8af46464cf28d81424c5544119d54ddd802b52b2022f89cf108b --accepted-ref 8c1a24fe36a9e5e058fbca12ab1a0233ea134cf1 --order-id 038-a
+      - name: Candidate governance review bound to order 039-a
+        run: python3.12 oap/bin/oap_cli.py candidate-review --repo-root . --order oap/orders/039-a-minimal-lifecycle-streaming.md --order-sha256 1684962453fa81a33d8263bdd06147d58148cad5d95ff7d0d28c33155f2e66d3 --accepted-ref 6f7ae1aa662e103ddecd86375579e380c16468ea --order-id 039-a
 
       - name: Assert protected scientific surfaces are unchanged
         run: git diff --exit-code 4507cc78e333c0e48226b64266121171b7b8cea8 -- PLAN.md CRITICAL.md oap/bootstrap-sources.lock.json docs/bootstrap

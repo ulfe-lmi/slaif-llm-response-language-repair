@@ -2,24 +2,32 @@
 
 | | |
 | --- | --- |
-| Revision | 2.1, 2026-11-15 — current runnable architecture |
-| Prior revision | 2.0, SHA-256 `4df1664cec86aae1e3e07e19f61650919fa8dc5011acc67f411848eeee0a8ed9` |
-| Authorized base | `8c1a24fe36a9e5e058fbca12ab1a0233ea134cf1` |
+| Revision | 2.2, 2026-11-25 — current runnable architecture |
+| Prior revision | 2.1, SHA-256 `2fb71ce6b210d1c1cc26f44d81f8e80b34d9be1ec0569e68b44e0748ed81f63c` |
+| Authorized base | `6f7ae1aa662e103ddecd86375579e380c16468ea` |
 | Product agreement | [PLAN.md](PLAN.md) — protected, unchanged by this revision |
 | Compact projection | [ARCHITECTURE-for-agents.md](ARCHITECTURE-for-agents.md) |
 | DHA register | [CRITICAL.md](CRITICAL.md) |
 
-Revision 2.1 is the current revision: on the 2.0 re-description of the
-**implemented runnable proxy** it adds the transparent relay's early
-forwarding of proven initial reasoning on eligible streams (§5.3), closes the
-inherited defined-logprobs gap on non-200, non-eligible and bypassed Responses
-bodies (R6), and reconciles the PR43 transport and listener clauses with the
-actual default (transparent) mode and the legacy strict mode. It separates
-real runtime behavior from the historical library scaffold and from earlier
-engineering proposals, and reports the actual runtime values. The stable
-invariants LR-001…LR-014 and their meanings are preserved (LR-001 gains the
-bounded forwardable-reasoning exception); the change record and revision law
-are in [§18](#18-change-control-and-revision-record).
+Revision 2.2 is the current revision: on the 2.1 early-reasoning streaming
+profile (§5.3) it adds one explicitly proven minimal start-frame variant for
+top-level `response.created` and `response.in_progress` lifecycle events — the
+answer-free start snapshots actually observed from a V100 llama.cpp
+backend, whose response object carries only `id`/`object`/`status` — so
+initial reasoning streams after them instead of the stream latching at the
+first frame. The variant is structural and exact (event keys exactly
+`type`/`response`/`sequence_number` with a real nonnegative integer sequence
+number, a JSON boolean is not an integer; response keys exactly
+`id`/`object`/`status` with a nonempty string `id`,
+`object` exactly `response`, `status` exactly `in_progress`, and `output`
+ABSENT, not null), never inferred from a provider or model name, and covers no
+other event or carrier: `response.queued`, the general full-snapshot validator
+and the reasoning embedded-carrier checks keep their conservative rules, and
+an absent `output` is never treated as an empty list. The one-way buffer
+boundary, complete-answer capture, exact spans and strict acceptance are
+unchanged. This is a D0 bounded compatibility correction under the pinned
+order; the change record and revision law are in
+[§18](#18-change-control-and-revision-record).
 
 On this page: [Purpose](#1-purpose-and-scope) · [Boundary](#2-system-boundary) ·
 [Invariants](#3-fixed-product-invariants) · [Components](#4-components-and-module-ownership)
@@ -340,7 +348,17 @@ item whose carried parts are all proven), a proven reasoning or summary part
 delta (the `reasoning_text` and `reasoning_summary_text` families), a
 `content_part` frame only when its part is a proven reasoning part, or a
 response-start lifecycle snapshot whose `output` list is proven reasoning-only
-(a missing snapshot or list is unproven and buffers). Embedded
+(a missing snapshot or list is unproven and buffers), or — for a top-level
+`response.created` or `response.in_progress` event only — the proven minimal
+start snapshot: event keys exactly `type`/`response`/`sequence_number` with a
+real nonnegative integer sequence number (a JSON boolean is not an integer),
+response keys exactly
+`id`/`object`/`status` with a nonempty string `id`, `object` exactly
+`response`, `status` exactly `in_progress`, and `output` ABSENT (not null), so
+the complete allowed structure carries no answer payload; the proof is
+structural, never inferred from a provider or model name, `response.queued` is
+not covered, and every deviation falls back to the general snapshot rule,
+where an absent `output` remains unproven. Embedded
 `response`/`item`/`part`/`output` carriers must themselves be proven
 reasoning-only. Terminal events and the `[DONE]` marker, malformed frames,
 unknown field lines, duplicate labels, a missing JSON `type`, and a label that
@@ -816,4 +834,16 @@ runtime law, and never rewrite historical seeds to hide a revision.
 | Authorization | Order 038-a (pinned immutable), explicit owner early-reasoning-streaming instruction 2026-11-15 |
 | Scope | Initial exposed reasoning may precede completed answer capture; answer repair and delivery, exact spans and strict acceptance unchanged; affected PR43 transport, listener and intake clauses reconciled |
 | Semantic delta | New §5.3 streaming early-reasoning profile (proven-reasoning allowlist, one-way buffer boundary, ordinal mapping, no fabricated completion, quiet close only where no usable tail or the transport fails); LR-001 forwardable-reasoning exception; §5.2 pre-emission 502 on declared-length truncation plus post-emission quiet-close contract; R6 closure of the inherited defined-logprobs gap — every recognized Responses-route body is normalized, including non-200, non-eligible 200 (bypass) JSON of any status and incrementally filtered bypass SSE; transparent/strict mode, listener and intake framing/size facts (strict: declared `Content-Length` up to 2,000,000 bytes, any `Transfer-Encoding` rejected; transparent: 256 MiB, `chunked` accepted, absent `Content-Length` an empty body) reconciled with the actual default; §14 delivery-budget scope (cumulative active client-write time, fresh tail anchor); current service title |
+| Projections | Compact architecture, distillation map, manifest and generated-file identities synchronized in the same PR against the trusted accepted base |
+
+### 18.4 Current revision (2.2, 2026-11-25)
+
+| Field | Value |
+| --- | --- |
+| Prior revision | 2.1, SHA-256 `2fb71ce6b210d1c1cc26f44d81f8e80b34d9be1ec0569e68b44e0748ed81f63c` |
+| Accepted base | `6f7ae1aa662e103ddecd86375579e380c16468ea` |
+| Authorization | Order 039-a (pinned immutable), explicit owner repair-proxy compatibility instruction 2026-11-24 |
+| Classification | D0 bounded compatibility bugfix under explicit owner instruction |
+| Scope | §5.3 lifecycle allowlist gains one proven minimal start-frame variant; complete-answer capture, strict acceptance, exact spans, the one-way buffer boundary and all other clauses unchanged |
+| Semantic delta | A top-level `response.created` / `response.in_progress` event whose event keys are exactly `type`/`response`/`sequence_number` (real nonnegative integer sequence number, a JSON boolean is not an integer) and whose response keys are exactly `id`/`object`/`status` (nonempty string `id`, `object` exactly `response`, `status` exactly `in_progress`) with `output` ABSENT (not null) is explicitly proven answer-free and forwards early; the shape is structural, never inferred from a provider or model name, `response.queued` is not covered, embedded carriers keep the general conservative rule, and absent `output` is never an empty output list. Motivating evidence is the actually observed V100 llama.cpp start frames: the unpatched repair proxy's classifier latched its one-way boundary at the first frame while the unrepaired route streamed (raw first reasoning at 0.436 s; a 128-token repaired-port probe released first reasoning at 3.5169 s / completion at 3.5187 s) — transport/shape evidence only, not linguistic-quality evidence and not an engine guarantee or runtime switch |
 | Projections | Compact architecture, distillation map, manifest and generated-file identities synchronized in the same PR against the trusted accepted base |
