@@ -25,10 +25,15 @@ holding; the client marker event proves the safe prefix actually
 reached the client (stream order: every byte before the marker is
 already in the client buffer when the marker event fires); the
 forbidden canary is tracked as its own client event while completion
-is held.  The immutable pre-release snapshot is taken and checked
-BEFORE the release Event is set.  No fixed settle sleep acts as a
-proof, and every exchange releases the barrier, waits for client
-finished and joins the client thread in a finally block (asserted).
+is held, and after the producer-barrier and safe-marker waits the
+gate stays HELD across a finite negative-observation
+``forbidden_seen.wait`` (an Event.wait, not a settle sleep) that
+must time out - if wrongly forwarded forbidden bytes were in flight
+the single reader would set the event during that bounded wait.
+Only then is the immutable pre-release snapshot taken and checked,
+still before the release Event is set.  Every exchange releases the
+barrier, waits for client finished and joins the client thread in a
+finally block (asserted).
 
 EXPECTED_OLD_RUNTIME_FAILURES: the positive cases are EXPECTED TO
 FAIL on the old runtime (pre-039, accepted 6f7ae1a code) at the
@@ -361,16 +366,22 @@ def _gated_neg_exchange(harness: _ReasoningHarness, body: bytes,
                         cap: _DualCapture, *, safe_marker: bytes,
                         forbidden_markers: tuple[bytes, ...],
                         barrier_wait: float = 3.0,
+                        negative_wait: float = 0.5,
                         pre_release_check=None) -> bytes:
     """Negative-observation gated exchange (event-based, no settle
-    sleep).  Waits for the producer's barrier-entered event (the fake
-    proved its whole blocked section is flushed and it is holding),
-    then the client SAFE marker event (stream order: every byte before
-    the safe marker - including any wrongly forwarded forbidden frame
-    ahead of it - is already in the client buffer).  The immutable
-    pre-release snapshot is taken and ``pre_release_check`` runs while
-    the gate is still held (forbidden event/bytes must be absent).
-    finally: release, client finished-wait, thread join (asserted)."""
+    sleep as proof).  Waits for the producer's barrier-entered event
+    (the fake proved its whole blocked section is flushed and it is
+    holding), then the client SAFE marker event (stream order: every
+    byte before the safe marker is already in the client buffer).
+    The gate then STAYS HELD across a finite negative-observation
+    ``forbidden_seen.wait(negative_wait)``: a wrongly forwarded
+    forbidden frame already in flight is drained by the single
+    reader and sets the event during that bounded wait, so a timeout
+    (event still unset) is the negative observation - an Event.wait,
+    not a settle sleep.  Only when the event remains unset is the
+    immutable pre-release snapshot taken and ``pre_release_check``
+    runs, still before the release Event is set.  finally: release,
+    client finished-wait, thread join (asserted)."""
     thread = _start_dual_client(harness.proxy_port, body, cap,
                                 safe_marker, forbidden_markers)
     snapshot = b""
@@ -380,6 +391,9 @@ def _gated_neg_exchange(harness: _ReasoningHarness, body: bytes,
         if not cap.canary_seen.wait(barrier_wait):
             raise AssertionError("safe prefix marker never reached the "
                                  "client while the gate was held")
+        if cap.forbidden_seen.wait(negative_wait):
+            raise AssertionError("forbidden bytes were observed while "
+                                 "the gate was held")
         snapshot = cap.pre_release_snapshot = cap.blob
         if pre_release_check is not None:
             pre_release_check(snapshot)
