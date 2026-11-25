@@ -22,9 +22,11 @@ sys.path.insert(0, str(ROOT))
 
 import proxy  # noqa: E402
 from sse_streaming import (  # noqa: E402
+    _minimal_lifecycle_denial_reason,
     classify_prefix_frame,
     emit_new_frames,
     split_complete_frames,
+    strip_event_logprobs,
 )
 
 
@@ -196,6 +198,254 @@ class TestLifecycleSnapshot(unittest.TestCase):
     def test_nondict_item_unproven(self):
         response = dict(_RESPONSE, output=["x"])
         self.assertEqual((_decision(self._lifecycle("response.created", response)).kind, _decision(self._lifecycle("response.created", response)).reason), ("boundary", "lifecycle unproven output item"))
+
+
+class TestMinimalLifecycle(unittest.TestCase):
+    """039-a R1/R2: the exact proven minimal start-frame variant.
+
+    A top-level response.created / response.in_progress frame is
+    forwardable when its complete structure is exactly
+    {type, response, sequence_number} / {id, object, status} with a
+    real nonnegative integer sequence, so output is ABSENT and no
+    answer payload can ride in the frame.  Every deviation remains a
+    boundary through the unchanged general validator, and the variant
+    never applies to response.queued or to embedded carriers.
+    """
+
+    _RESPONSE_MINIMAL = {"id": "r_1", "object": "response",
+                         "status": "in_progress"}
+
+    def _minimal_value(self, etype, seq=0, response=None, **extra):
+        value = {"type": etype, "sequence_number": seq,
+                 "response": dict(self._RESPONSE_MINIMAL,
+                                  **(response or {}))}
+        value.update(extra)
+        return value
+
+    def _minimal_frame(self, etype, seq=0, label=True, response=None,
+                       **extra):
+        value = self._minimal_value(etype, seq, response, **extra)
+        if not label:
+            return _data_frame(value)
+        return _frame(etype, value)
+
+    # --- positive: the proven minimal shape forwards early ----------
+
+    def test_created_minimal_prefix(self):
+        d = _decision(self._minimal_frame("response.created"))
+        self.assertEqual((d.kind, d.reason),
+                         ("prefix", "lifecycle minimal no-answer-payload"))
+        self.assertEqual(
+            d.value,
+            {"type": "response.created", "sequence_number": 0,
+             "response": self._RESPONSE_MINIMAL})
+
+    def test_in_progress_minimal_prefix(self):
+        d = _decision(self._minimal_frame("response.in_progress", seq=1))
+        self.assertEqual((d.kind, d.reason),
+                         ("prefix", "lifecycle minimal no-answer-payload"))
+
+    def test_minimal_without_label_prefix(self):
+        # No event: label - the JSON type alone identifies the family.
+        d = _decision(self._minimal_frame("response.created", label=False))
+        self.assertEqual((d.kind, d.reason),
+                         ("prefix", "lifecycle minimal no-answer-payload"))
+
+    def test_minimal_sequence_values(self):
+        for seq in (0, 1, 2**32):
+            with self.subTest(seq=seq):
+                d = _decision(self._minimal_frame("response.created", seq=seq))
+                self.assertEqual(d.kind, "prefix", seq)
+
+    def test_minimal_nonempty_id(self):
+        d = _decision(self._minimal_frame(
+            "response.created",
+            response={"id": "x" * 50, "object": "response",
+                      "status": "in_progress"}))
+        self.assertEqual(d.kind, "prefix")
+
+    def test_minimal_frame_logprobs_strip_noop(self):
+        # The minimal response carries no defined logprobs location, so
+        # the shared strip is a no-op and the raw block is forwarded.
+        value = self._minimal_value("response.created")
+        self.assertFalse(strip_event_logprobs(value))
+        self.assertEqual(value, self._minimal_value("response.created"))
+
+    # --- negative: every deviation remains a boundary ---------------
+
+    def test_queued_is_outside_minimal_scope(self):
+        # response.queued is not in the minimal variant; absent output
+        # is still unproven for it (general validator unchanged).
+        d = _decision(self._minimal_frame("response.queued"))
+        self.assertEqual((d.kind, d.reason),
+                         ("boundary", "lifecycle snapshot unproven"))
+
+    def test_event_extra_key_boundary(self):
+        d = _decision(self._minimal_frame("response.created", model="m"))
+        self.assertEqual((d.kind, d.reason),
+                         ("boundary", "lifecycle snapshot unproven"))
+
+    def test_missing_sequence_number_boundary(self):
+        value = self._minimal_value("response.created")
+        del value["sequence_number"]
+        d = _decision(_frame("response.created", value))
+        self.assertEqual((d.kind, d.reason),
+                         ("boundary", "lifecycle snapshot unproven"))
+
+    def test_sequence_not_real_integer_boundary(self):
+        for seq in (True, False, -1, 0.0, "0", None, [0]):
+            with self.subTest(seq=repr(seq)):
+                d = _decision(self._minimal_frame("response.created", seq=seq))
+                self.assertEqual(d.kind, "boundary")
+
+    def test_response_non_dict_boundary(self):
+        for resp in (None, "x", 5, []):
+            with self.subTest(resp=repr(resp)):
+                value = self._minimal_value("response.created")
+                value["response"] = resp
+                d = _decision(_frame("response.created", value))
+                self.assertEqual((d.kind, d.reason),
+                                 ("boundary", "lifecycle snapshot unproven"))
+
+    def test_response_extra_key_boundary(self):
+        # Any fourth response key is not the exact minimal shape; in
+        # particular output present as null is not an empty list.
+        for extra in ({"output": None}, {"model": "m"}):
+            with self.subTest(extra=repr(extra)):
+                response = dict(self._RESPONSE_MINIMAL)
+                response.update(extra)
+                d = _decision(self._minimal_frame("response.created",
+                                                  response=response))
+                self.assertEqual((d.kind, d.reason),
+                                 ("boundary", "lifecycle snapshot unproven"))
+
+    def test_output_empty_list_is_full_snapshot_not_minimal(self):
+        # Four response keys (with output: []) are the GENERAL
+        # full-snapshot proof, not the minimal variant: unchanged old
+        # behavior and old reason.
+        response = dict(self._RESPONSE_MINIMAL, output=[])
+        d = _decision(self._minimal_frame("response.created",
+                                          response=response))
+        self.assertEqual((d.kind, d.reason),
+                         ("prefix", "lifecycle no-answer-payload"))
+
+    def test_id_unproven_boundary(self):
+        for rid in ("", 5, None, ["r"]):
+            with self.subTest(rid=repr(rid)):
+                response = dict(self._RESPONSE_MINIMAL, id=rid)
+                d = _decision(self._minimal_frame("response.created",
+                                                  response=response))
+                self.assertEqual((d.kind, d.reason),
+                                 ("boundary", "lifecycle snapshot unproven"))
+
+    def test_object_unproven_boundary(self):
+        for obj in ("resp", "Response", None, 1):
+            with self.subTest(obj=repr(obj)):
+                response = dict(self._RESPONSE_MINIMAL, object=obj)
+                d = _decision(self._minimal_frame("response.created",
+                                                  response=response))
+                self.assertEqual((d.kind, d.reason),
+                                 ("boundary", "lifecycle snapshot unproven"))
+
+    def test_status_unproven_boundary(self):
+        cases = {"queued": "lifecycle snapshot unproven",
+                 "completed": "lifecycle terminal or unknown status",
+                 "mystery": "lifecycle terminal or unknown status",
+                 None: "lifecycle terminal or unknown status",
+                 1: "lifecycle terminal or unknown status"}
+        for status, reason in cases.items():
+            with self.subTest(status=repr(status)):
+                response = dict(self._RESPONSE_MINIMAL, status=status)
+                d = _decision(self._minimal_frame("response.created",
+                                                  response=response))
+                self.assertEqual((d.kind, d.reason), ("boundary", reason))
+
+    def test_malformed_and_duplicate_keys_boundary(self):
+        block = ("event: response.created\n"
+                 "data: {\"type\":\"response.created\",\"sequence_number\":0,"
+                 "\"response\":{\"id\":\"r_1\"},"
+                 "\"response\":{\"id\":\"r_1\"}}\n\n")
+        self.assertEqual((_decision(block).kind, _decision(block).reason),
+                         ("boundary", "malformed data"))
+        self.assertEqual((_decision("event: response.created\ndata: {nope}\n\n").kind,
+                          _decision("event: response.created\ndata: {nope}\n\n").reason),
+                         ("boundary", "malformed data"))
+
+    def test_label_mismatch_boundary(self):
+        block = _frame("response.in_progress",
+                       self._minimal_value("response.created"))
+        self.assertEqual((_decision(block).kind, _decision(block).reason),
+                         ("boundary", "event label/type mismatch"))
+
+    def test_embedded_minimal_carrier_stays_conservative(self):
+        # R2: the reasoning embedded-carrier check does NOT adopt the
+        # minimal proof; an unproven response carrier still buffers.
+        value = {"type": "response.reasoning_text.delta",
+                 "sequence_number": 2, "delta": "x",
+                 "response": dict(self._RESPONSE_MINIMAL)}
+        d = _decision(_frame("response.reasoning_text.delta", value))
+        self.assertEqual((d.kind, d.reason),
+                         ("boundary", "embedded response unproven"))
+
+    def test_full_snapshot_regression(self):
+        # vLLM-style full snapshots keep their existing behavior and
+        # reason, with or without sequence_number on the event.
+        full = {"type": "response.created", "sequence_number": 0,
+                "response": dict(self._RESPONSE_MINIMAL, output=[])}
+        self.assertEqual(
+            (_decision(_frame("response.created", full)).kind,
+             _decision(_frame("response.created", full)).reason),
+            ("prefix", "lifecycle no-answer-payload"))
+        full_item = {"type": "response.in_progress",
+                     "response": dict(self._RESPONSE_MINIMAL,
+                                      output=[dict(_REASONING_ITEM)])}
+        self.assertEqual(
+            _decision(self._lifecycle_like("response.in_progress",
+                                           full_item)).kind, "prefix")
+
+    def _lifecycle_like(self, etype, value):
+        return _frame(etype, value)
+
+    # --- helper denial reasons (direct unit proof) -------------------
+
+    def test_helper_reasons(self):
+        base = self._minimal_value("response.created")
+        self.assertIsNone(_minimal_lifecycle_denial_reason(base))
+        self.assertIsNone(
+            _minimal_lifecycle_denial_reason(
+                self._minimal_value("response.in_progress", seq=7)))
+        cases = [
+            (dict(base, type="response.queued"),
+             "minimal lifecycle event unproven"),
+            (dict(base, type=None), "minimal lifecycle event unproven"),
+            (dict(base, extra=1), "minimal lifecycle shape unproven"),
+            ({k: v for k, v in base.items() if k != "sequence_number"},
+             "minimal lifecycle shape unproven"),
+            (dict(base, sequence_number=True),
+             "minimal lifecycle sequence unproven"),
+            (dict(base, sequence_number=-1),
+             "minimal lifecycle sequence unproven"),
+            (dict(base, sequence_number=0.0),
+             "minimal lifecycle sequence unproven"),
+            (dict(base, response="x"),
+             "minimal lifecycle response unproven"),
+            (dict(base, response=dict(self._RESPONSE_MINIMAL, output=[])),
+             "minimal lifecycle response shape unproven"),
+            (dict(base, response=dict(self._RESPONSE_MINIMAL, id="")),
+             "minimal lifecycle id unproven"),
+            (dict(base, response=dict(self._RESPONSE_MINIMAL, id=5)),
+             "minimal lifecycle id unproven"),
+            (dict(base, response=dict(self._RESPONSE_MINIMAL, object="resp")),
+             "minimal lifecycle object unproven"),
+            (dict(base, response=dict(self._RESPONSE_MINIMAL, status="queued")),
+             "minimal lifecycle status unproven"),
+            (dict(base, response=dict(self._RESPONSE_MINIMAL, status="completed")),
+             "minimal lifecycle status unproven"),
+        ]
+        for value, reason in cases:
+            with self.subTest(reason=reason):
+                self.assertEqual(_minimal_lifecycle_denial_reason(value),
+                                 reason)
 
 
 class TestReasoningFamilies(unittest.TestCase):

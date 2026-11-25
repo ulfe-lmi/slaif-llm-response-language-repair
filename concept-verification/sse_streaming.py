@@ -26,8 +26,13 @@ exactly as the strict runtime parser reads them.  A frame is early
 forwardable only when its structure is explicitly proven: reasoning
 content must be a proven reasoning item, proven reasoning part or
 proven summary part, and a lifecycle snapshot is forwardable only
-when its output list is proven to hold only reasoning items.  Message,
-tool, unknown and malformed structures are buffered, never guessed.
+when its output list is proven to hold only reasoning items, or the
+frame is the proven minimal start snapshot (order 039-a R1): a top
+level response.created / response.in_progress event whose keys are
+exactly type/response/sequence_number carrying a response whose keys
+are exactly id/object/status, so output is absent and no answer
+payload can ride in the frame.  Message, tool, unknown and malformed
+structures are buffered, never guessed.
 """
 
 from __future__ import annotations
@@ -58,6 +63,17 @@ LIFECYCLE_NONTERMINAL_EVENT_TYPES = frozenset(
 # may carry when the field is present (validated nonterminal prefix,
 # order 038-a R1).
 LIFECYCLE_NONTERMINAL_STATUSES = frozenset({"queued", "in_progress"})
+
+# Top-level lifecycle events proven startable with the minimal
+# answer-free snapshot shape (order 039-a R1): an actual V100
+# llama.cpp backend observed emitting response.created and
+# response.in_progress whose response object carries only
+# id/object/status.  The proof is structural and exact - never
+# inferred from a provider or model name - and response.queued is not
+# covered by the minimal variant.
+MINIMAL_LIFECYCLE_EVENT_TYPES = frozenset(
+    {"response.created", "response.in_progress"}
+)
 
 # Reasoning event spellings evidenced by the documented Responses
 # stream, the frozen synthetic Qwen fixtures, and the observed
@@ -225,6 +241,46 @@ def _valid_reasoning_item(item: object) -> bool:
     return True
 
 
+def _minimal_lifecycle_denial_reason(value: dict[str, object]) -> str | None:
+    """Denial reason for the proven minimal lifecycle start frame
+    (order 039-a R1), or None when the frame's complete structure is
+    explicitly proven answer-free.
+
+    The minimal variant is a distinct exact shape, not a relaxation of
+    the general full-snapshot validator: the event type is exactly
+    response.created or response.in_progress, the event keys are
+    exactly type/response/sequence_number with sequence_number a real
+    nonnegative integer (a bool is not an int), and the response keys
+    are exactly id/object/status with id a nonempty string, object
+    exactly "response" and status exactly "in_progress".  output is
+    ABSENT, not null: the complete allowed structure carries no answer
+    payload, so no other field can ride in the frame.  Any deviation -
+    an extra or missing key at either level, a wrong or missing type,
+    null, a negative or boolean sequence number, a queued/terminal or
+    unknown status, or a non-dict response - is not the proven minimal
+    shape; the caller then falls back to the general validator, and an
+    absent output is never treated as an empty output list."""
+    if value.get("type") not in MINIMAL_LIFECYCLE_EVENT_TYPES:
+        return "minimal lifecycle event unproven"
+    if set(value) != {"type", "response", "sequence_number"}:
+        return "minimal lifecycle shape unproven"
+    sequence = value["sequence_number"]
+    if type(sequence) is not int or sequence < 0:
+        return "minimal lifecycle sequence unproven"
+    response = value["response"]
+    if not isinstance(response, dict):
+        return "minimal lifecycle response unproven"
+    if set(response) != {"id", "object", "status"}:
+        return "minimal lifecycle response shape unproven"
+    if type(response["id"]) is not str or not response["id"]:
+        return "minimal lifecycle id unproven"
+    if response["object"] != "response":
+        return "minimal lifecycle object unproven"
+    if response["status"] != "in_progress":
+        return "minimal lifecycle status unproven"
+    return None
+
+
 def _lifecycle_denial_reason(response: object) -> str | None:
     """Denial reason for a lifecycle snapshot, or None when the
     snapshot is explicitly proven answer-free: a PRESENT status must
@@ -334,6 +390,13 @@ def classify_prefix_frame(
     if event_type in TERMINAL_EVENT_TYPES:
         return FrameDecision("boundary", "terminal event")
     if event_type in LIFECYCLE_NONTERMINAL_EVENT_TYPES:
+        if (
+            event_type in MINIMAL_LIFECYCLE_EVENT_TYPES
+            and _minimal_lifecycle_denial_reason(value) is None
+        ):
+            return FrameDecision(
+                "prefix", "lifecycle minimal no-answer-payload", value
+            )
         denial = _lifecycle_denial_reason(value.get("response"))
         if denial is not None:
             return FrameDecision("boundary", denial)

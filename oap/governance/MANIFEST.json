@@ -1,6 +1,6 @@
 {
  "accepted_base": "UNRESOLVED until owner-reviewed baseline publication",
- "coding_bytes": 41335,
+ "coding_bytes": 41342,
  "coding_read_set": [
   "AGENTS.md",
   "oap/coding-instructions/AGENTS.md",
@@ -25,11 +25,11 @@
    "source": "ARCHITECTURE §11"
   },
   "A-API-01": {
-   "comparison": "UPDATED (038-a, 2026-11-15): re-stated against root ARCHITECTURE 2.1 under the pinned order's authorized current-source revision; stable clause ID retained, obligation realigned to the implemented runnable proxy. Generator semantic review, not independent proof.",
+   "comparison": "UPDATED (039-a, 2026-11-25): re-stated against root ARCHITECTURE 2.2 under the pinned order's authorized current-source revision; proven minimal created/in_progress start-frame variant added to the §5.3 lifecycle allowlist, stable clause ID and all other conditions retained. Generator semantic review, not independent proof.",
    "file": "ARCHITECTURE-for-agents.md",
-   "normative_obligation": "Transparent default (CONCEPT_PASSTHROUGH=1) relays all routes; only recognized Responses bodies change. Repair candidate: POST /v1/responses, identity encoding, strict JSON object, store exactly false, background absent/false, previous_response_id/conversation absent/null, stream boolean (default false), plain-text response_format/text.format. Tools/functions/images/multimodal history do not block candidacy; the completed plain answer must independently qualify. Structured/stored requests bypass repair, still §13-normalized. Strict mode (=0): only POST /v1/responses (others 404); stateless string or text-only message sequence (each exactly role+content; roles user/assistant/system/developer); store:false; no previous_response_id/conversation/incomplete_details, tools/functions/images/structured output or request logprobs/include (400 REQUEST_UNSUPPORTED pre-forward). Strict contract violations: 400 invalid_request, zero main work; 200 mode mismatch: 502 RESPONSE_MODE_MISMATCH. Transparent uses actual content type. stream:false returns JSON; strict SSE stays fully buffered. Eligible transparent SSE: only strict complete-frame reasoning/lifecycle allowlist; first answer/tool/unknown/ambiguous/malformed/terminal frame irrevocably buffers all later frames. Retain full bounded ORIGINAL capture; validate sent-prefix frame ordinals before tail delivery, never transformed-byte offsets, replay or reordering. History carries the delivered final answer, no draft/reviewer injection. Reviewer usage is request-local; absent/invalid means unknown, never zero; no carryover; edited length is no inference bill. Role: coding.",
+   "normative_obligation": "Transparent default (CONCEPT_PASSTHROUGH=1) relays all routes; only recognized Responses bodies change. Repair candidate: POST /v1/responses, identity encoding, strict JSON object, store exactly false, background absent/false, previous_response_id/conversation absent/null, stream boolean (default false), plain-text response_format/text.format. Tools/functions/images/multimodal history do not block candidacy; the completed plain answer must independently qualify. Structured/stored requests bypass repair, still §13-normalized. Strict mode (=0): only POST /v1/responses (others 404); stateless string or text-only message sequence (each exactly role+content; roles user/assistant/system/developer); store:false; no previous_response_id/conversation/incomplete_details, tools/functions/images/structured output or request logprobs/include (400 REQUEST_UNSUPPORTED pre-forward). Strict contract violations: 400 invalid_request, zero main work; 200 mode mismatch: 502 RESPONSE_MODE_MISMATCH. Transparent uses actual content type. stream:false returns JSON; strict SSE stays fully buffered. Eligible transparent SSE: only strict complete-frame reasoning/lifecycle allowlist, lifecycle adding proven minimal created/in_progress start frames (exact keys, output absent, not provider-inferred; absent output is not empty); first answer/tool/unknown/ambiguous/malformed/terminal frame irrevocably buffers all later frames. Retain full bounded ORIGINAL capture; validate sent-prefix frame ordinals before tail delivery, never transformed-byte offsets, replay or reordering. History carries the delivered final answer, no draft/reviewer injection. Reviewer usage is request-local; absent/invalid means unknown, never zero; no carryover; edited length is no inference bill. Role: coding.",
    "role_scope": "coding; other roles retain their own law",
-   "source": "ARCHITECTURE §5.1"
+   "source": "ARCHITECTURE §§5.1,5.3"
   },
   "A-CLOSE-01": {
    "comparison": "UPDATED (038-a, 2026-11-15): re-stated against root ARCHITECTURE 2.1 under the pinned order's authorized current-source revision; stable clause ID retained, obligation realigned to the implemented runnable proxy. Generator semantic review, not independent proof.",
@@ -521,12 +521,12 @@
    "sha256": "118be17b2e9e5b50d628c796b136ee1b8154ebf844af0007839f65848fd69f09"
   },
   "ARCHITECTURE-for-agents.md": {
-   "bytes": 19993,
-   "sha256": "0d453224ad82948829e2bfea9381120fd0eaa41281afc0a5de99cdfff56ffd31"
+   "bytes": 20000,
+   "sha256": "e52d30b391c1a84b96c706c09803e06b81b5a140755e851b6c59db13bd001a17"
   },
   "ARCHITECTURE.md": {
-   "bytes": 53232,
-   "sha256": "2fb71ce6b210d1c1cc26f44d81f8e80b34d9be1ec0569e68b44e0748ed81f63c"
+   "bytes": 56363,
+   "sha256": "6a93315cdbc24cee9124b7c187c4757f5531f3ee65be453d0db0471f511a35db"
   },
   "OAP-COMMUNICATION-coding-agent.md": {
    "bytes": 7270,
@@ -549,8 +549,8 @@
    "sha256": "db624bb41b34d8263bc5745083d86e7db5bb8907816cd8725871e7225eb6ce9d"
   },
   "oap/governance/DISTILLATION-MAP.md": {
-   "bytes": 72455,
-   "sha256": "2352a60133d7e71ca578919c580e4f0c6d1253945e6b6d2cc0d12aa26675611e"
+   "bytes": 72670,
+   "sha256": "aaa945c445640937a231eb8e236f60e0085a13fe4f9a0afcabda3c052ad5b927"
   },
   "oap/governance/WORKSPACE-LAYOUT.json": {
    "bytes": 1131,

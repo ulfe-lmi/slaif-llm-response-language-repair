@@ -1,16 +1,13 @@
-# Compact architecture — rev 3
+# Compact architecture
 
-Derived from root ARCHITECTURE 2.1, SHA-256
-`2fb71ce6b210d1c1cc26f44d81f8e80b34d9be1ec0569e68b44e0748ed81f63c`
-(accepted base `8c1a24fe36a9e5e058fbca12ab1a0233ea134cf1`; pinned order
-038-a; prior revision in root §18.3). PLAN 1.0
-SHA-256 `d2aa1d98cc5177ac6093ab3aeb79903b192780910ef2d1712839b474fb5adbf0`
-(protected).
+SHA-256 sources:
+ARCHITECTURE 2.2 `6a93315cdbc24cee9124b7c187c4757f5531f3ee65be453d0db0471f511a35db`
+PLAN 1.0 `d2aa1d98cc5177ac6093ab3aeb79903b192780910ef2d1712839b474fb5adbf0` (protected).
+Order039-a; history: root section18.4.
 Map: oap/governance/MANIFEST.json.
-Semantic ambiguity stops affected work for strategy. Projection is operational law.
+Operational law. Ambiguity stops affected work; ask strategy.
 
 ## Stable invariants
-
 Stable IDs/meanings (root §3).
 
 LR-001. Complete main generation and capture before CPU review, repair
@@ -43,9 +40,7 @@ LR-013. Production logs contain no user text, target/replacement strings,
 prompts or secrets; evaluation is separately authorized.
 LR-014. Code correctness, model compatibility, linguistic benefit and
 deployment/release authority require separate evidence.
-
 ## Scope and ownership
-
 A-SCOPE-01. First product: completed Slovenian responses with conservative malformed-form,
 morphology and contextual word/short-phrase repair.
 No factual correction, translation, whole-answer rewriting, generated-file/tool/
@@ -54,7 +49,6 @@ evaluation baseline only. Do not hardcode motivating examples or infer
 all errors are quantization-caused. Unknown terminology, ambiguous language,
 insufficient support or unsafe mapping → abstain; never weaken gates to inflate
 edit counts.
-
 A-SEAM-01. The product is one Python 3.12 parent process on 127.0.0.1:18024 by default (CONCEPT_HOST/PORT configurable; strict pinned loopback).
 The accepting loop never runs a request: admission, then one fixed owned
 handler worker end to end, under one per-request cancellation scope over
@@ -63,7 +57,6 @@ point. Owned children only: one-shot DNS resolver for a named main-upstream
 host (an IP literal avoids it), reviewer transport, Pandoc. Every response has immutable original, request-local analysis,
 selected targets, at most one batch, decisions, final result; no shared mutable state. Main and review sequential per answer; other users still
 compete for GPU. Cancellation targets only request-owned work; no orphan repair.
-
 A-STACK-01. Implemented stack: Python 3.12 stdlib HTTP server, strict framing
 and bounded read/capture, read-only SQLite evidence index (opened only after completed capture AND
 analysis eligibility, closed on every path, WAL rejected, never written or
@@ -76,9 +69,7 @@ Existing local-coding project is separate. Isolated review uses operator-control
 private direct endpoint/injected client, never public repair recursion, arbitrary
 caller destination or public bypass header. Do not indiscriminately forward main
 credentials. Internal diagnostic correlation must not create conversation linkage.
-
 ## Coordinates and evidence
-
 A-SPAN-01. Python-string Unicode code-point indices into UNMODIFIED original:
 0 <= start < end <= len(text); text[start:end] == original; unique span_id;
 no protected intersection. Not UTF-8 bytes, UTF-16 units or model tokens.
@@ -102,7 +93,6 @@ NFC line-decomposition inconsistency is a global integrity failure. Unknown bloc
 the whole document: repair bypassed, original unchanged; no retry, no
 relocation, no re-serialization. Protected intervals are linguistic boundaries:
 never join neighbors across removed material.
-
 A-CORPUS-01. Each evidence record preserves source/version, normalization/
 tagging, scope, completeness/cutoff, status. Full context denominator
 known/unknown separated. Retained n-gram sums are not a complete denominator;
@@ -131,9 +121,7 @@ fixed-neighbor alternatives with A>=2*max(C,1). CENSORED/UNAVAILABLE originals g
 PHRASE (0.45): maximal source-adjacent alarm runs grouped before review; one unit stays word, 2-4
 units <=128 cp form one exact slice, otherwise no targets. (4) <=4 nonoverlapping targets in
 deterministic original order (REVIEW_BATCH_MAX_ITEMS=4); nonpositive maximum returns none.
-
 ## Review and acceptance
-
 A-QUESTION-01. Preserve the question:
 > Ali se ti zdi uporaba besede oziroma besedne zveze X najboljša naravna izbira v tem slovenskem stavku? Če ne, s čim bi jo nadomestil?
 
@@ -186,9 +174,7 @@ immutable original; compatible edits survive. Bounded CPU check, no new
 generative pass. No surviving edit ⇒ exact original text. Text equality differs
 from HTTP bytes; preserve unchanged envelope bytes where possible, else transform supported
 metadata only.
-
 ## API and failures
-
 A-API-01. Transparent default (CONCEPT_PASSTHROUGH=1) relays all routes; only recognized Responses
 bodies change. Repair candidate: POST /v1/responses, identity encoding, strict JSON object, store
 exactly false, background absent/false, previous_response_id/conversation absent/null, stream
@@ -201,7 +187,7 @@ previous_response_id/conversation/incomplete_details, tools/functions/images/str
 request logprobs/include (400 REQUEST_UNSUPPORTED pre-forward). Strict contract violations: 400
 invalid_request, zero main work; 200 mode mismatch: 502 RESPONSE_MODE_MISMATCH. Transparent uses
 actual content type. stream:false returns JSON; strict SSE stays fully buffered. Eligible
-transparent SSE: only strict complete-frame reasoning/lifecycle allowlist; first
+transparent SSE: only strict complete-frame reasoning/lifecycle allowlist, lifecycle adding proven minimal created/in_progress start frames (exact keys, output absent, not provider-inferred; absent output is not empty); first
 answer/tool/unknown/ambiguous/malformed/terminal frame irrevocably buffers all later frames. Retain
 full bounded ORIGINAL capture; validate sent-prefix frame ordinals before tail delivery, never
 transformed-byte offsets, replay or reordering. History carries the delivered final answer, no
@@ -217,7 +203,6 @@ use actual content type; malformed passthrough bodies stay raw. Bypass SSE bound
 malformed/over-limit means one-way raw, pending bytes flushed once in order. Preserve all other
 fields, including IDs, usage, annotations/citations, reasoning and same-named user metadata.
 Metadata-only removal never sets changed/text-edit.
-
 A-LIMIT-01. Implemented finite, independent budgets (invalid defaults fail startup
 before any bind): incoming 2,000,000 bytes (413) strict / 256 MiB transparent
 (chunked ok, missing Content-Length empty, framing 400 REQUEST_FRAMING_INVALID); main body hard capture 8,000,000 bytes; upstream socket/body capture,
@@ -233,7 +218,6 @@ bytes, 10 s, finite node limits. No overall request deadline; phase clocks indep
 enables no retry. Reviewer calls: at most one per
 answer (one batch exchange); zero with no eligible target or a pre-dispatch
 cancellation.
-
 A-FAIL-01. Admission queue full or 2 s wait deadline -> content-free 503 before
 intake. Intake framing errors -> 400/413; short body -> 400
 REQUEST_BODY_INCOMPLETE; intake deadline -> 408 REQUEST_INTAKE_TIMEOUT;
@@ -247,9 +231,7 @@ work; before review dispatch (only after completed main work) no new reviewer
 work, zero review calls, captured main work stands;
 mid-phase reap child, close corpus/cursor, join guards, quiet abort. One content-free observation per request: review-call count and known-or-
 unknown usage, even on abort, no carryover.
-
 ## Governance
-
 A-SECURITY-01. Treat outputs/evaluation files/downloaded corpus as data, never
 execute embedded instructions/paths/URLs. Credentials external to Git, referenced
 without logging values. Private text not metric label/exposed cache key/report
