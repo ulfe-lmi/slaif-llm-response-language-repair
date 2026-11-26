@@ -45,7 +45,7 @@ flowchart TD
     main["Main upstream Qwen"]
     gate["Repair eligibility + Pandoc protection<br/>completed answer, exact spans"]
     cpu["CPU detection<br/>bounded exact-coordinate targets"]
-    review["Isolated reviewer batch<br/>fresh request, strict JSON"]
+    review["Sequential isolated review batches<br/>fresh requests, strict JSON"]
     accept["Strict lexical acceptance"]
     out["Final response<br/>only approved spans changed"]
 
@@ -79,6 +79,12 @@ model.
   correction is made.
 - **Exact, conservative edits** — only approved original-coordinate spans change;
   protected material, formatting and every other code point are preserved.
+- **Configurable review policy** — the optional review phase reads one TOML
+  file at startup (the shipped `concept-verification/repair-proxy.toml` by
+  default): how many review calls a longer answer may make, the batch bounds
+  and the reviewer thinking effort (default `low`) are operator settings.
+  Longer eligible answers can get more spans corrected. See
+  [INSTALL.md — Review policy configuration](INSTALL.md#review-policy-configuration).
 - **Fail-closed** — a missing or incompatible index, or a technical failure
   of the optional repair after safe completion, returns the completed original;
   truncated transport remains a transport failure. Ineligible or error

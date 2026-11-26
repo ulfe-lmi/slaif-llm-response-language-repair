@@ -66,12 +66,17 @@ semantics.
 - **Evidence.** Read-only derived SQLite index; lookups are finite and
   budgeted. Absence and censoring keep their distinct semantics (see above).
 - **Review.** Without eligible suspicion there are zero review calls;
-  otherwise at most one isolated occurrence-addressed batch of one
-  non-streaming Qwen request containing up to four targets, with a
-  typed completed envelope. Defined logprobs are removed unconditionally before any
-  eligibility decision, and main-generation usage and review usage are
-  accounted separately; neither is an inference bill for the edited text
-  length.
+  otherwise CPU-selected occurrences are reviewed in sequential isolated
+  occurrence-addressed batches of one non-streaming Qwen request each,
+  scaled to the completed answer length under one operator-configurable
+  policy (default reviewer thinking effort `low`; see
+  [INSTALL.md — Review policy configuration](../INSTALL.md#review-policy-configuration)).
+  The default allowance is ceil(N / 1,024) calls for N code points of the
+  completed original answer, with up to four targets per call. Empty
+  batches are never sent. Defined logprobs are removed unconditionally
+  before any eligibility decision, and main-generation usage and review
+  usage are accounted separately; neither is an inference bill for the
+  edited text length.
 - **Acceptance.** Strict lexical acceptance: an accepted replacement is 1–4
   lexical words with summed word-character length ≤ 80; each proposed
   replacement is bounded at 128 code points and 8 words, and multiword
@@ -101,6 +106,7 @@ grouped by runtime concern:
 - **Main-upstream generation**
   - [upstream_setup.py](upstream_setup.py) and [upstream_worker.py](upstream_worker.py) — bounded main-upstream setup and owned fetch.
 - **Reviewer**
+  - [review_policy.py](review_policy.py) and [repair-proxy.toml](repair-proxy.toml) — the immutable operator review policy and its shipped adjacent default file.
   - [review_transport.py](review_transport.py) and [review_worker.py](review_worker.py) — isolated non-streaming reviewer exchange.
   - [batch_review.py](batch_review.py) — occurrence-addressed proposal batches and caps.
   - [qwen_client.py](qwen_client.py) — reviewer HTTP client, typed completed envelope.

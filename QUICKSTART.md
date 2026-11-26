@@ -81,3 +81,8 @@ delivered unchanged. Set `CONCEPT_PORT` to select a listener port. See
 [proxy chaining](docs/PROXY-CHAINING.md) for forwarding and streaming details,
 **[INSTALL.md](INSTALL.md)** for the full setup and troubleshooting, and
 **[ARCHITECTURE.md](ARCHITECTURE.md)** for what the proxy does with a response.
+
+The optional review phase uses the shipped review policy by default; the full
+nine settings (review-call allowance, batch bounds, timeout, thinking effort)
+are documented in
+[INSTALL.md — Review policy configuration](INSTALL.md#review-policy-configuration).

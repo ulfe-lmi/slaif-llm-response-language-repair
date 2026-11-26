@@ -2,32 +2,16 @@
 
 | | |
 | --- | --- |
-| Revision | 2.2, 2026-11-25 — current runnable architecture |
-| Prior revision | 2.1, SHA-256 `2fb71ce6b210d1c1cc26f44d81f8e80b34d9be1ec0569e68b44e0748ed81f63c` |
-| Authorized base | `6f7ae1aa662e103ddecd86375579e380c16468ea` |
+| Revision | 2.3, 2026-11-26 — current runnable architecture |
+| Prior revision | 2.2, SHA-256 `6a93315cdbc24cee9124b7c187c4757f5531f3ee65be453d0db0471f511a35db` |
+| Authorized base | `d39361c4b8f93981436da76a4a77d8cf6b48396c` |
 | Product agreement | [PLAN.md](PLAN.md) — protected, unchanged by this revision |
 | Compact projection | [ARCHITECTURE-for-agents.md](ARCHITECTURE-for-agents.md) |
 | DHA register | [CRITICAL.md](CRITICAL.md) |
 
-Revision 2.2 is the current revision: on the 2.1 early-reasoning streaming
-profile (§5.3) it adds one explicitly proven minimal start-frame variant for
-top-level `response.created` and `response.in_progress` lifecycle events — the
-answer-free start snapshots actually observed from a V100 llama.cpp
-backend, whose response object carries only `id`/`object`/`status` — so
-initial reasoning streams after them instead of the stream latching at the
-first frame. The variant is structural and exact (event keys exactly
-`type`/`response`/`sequence_number` with a real nonnegative integer sequence
-number, a JSON boolean is not an integer; response keys exactly
-`id`/`object`/`status` with a nonempty string `id`,
-`object` exactly `response`, `status` exactly `in_progress`, and `output`
-ABSENT, not null), never inferred from a provider or model name, and covers no
-other event or carrier: `response.queued`, the general full-snapshot validator
-and the reasoning embedded-carrier checks keep their conservative rules, and
-an absent `output` is never treated as an empty list. The one-way buffer
-boundary, complete-answer capture, exact spans and strict acceptance are
-unchanged. This is a D0 bounded compatibility correction under the pinned
-order; the change record and revision law are in
-[§18](#18-change-control-and-revision-record).
+Revision 2.3 is the current revision: on the 2.2 minimal start-frame variant it replaces the fixed single-batch review with a **configurable length-scaled isolated review** — after complete main capture, one frozen-original CPU pass, a length-scaled call allowance B = ceil(N / characters_per_call) (default 1,024: 0 for empty, ≤32 at the default analysis gate), up to B sequential fresh isolated same-model batch-v1 requests, one immutable per-instance `[review]` policy loaded once at startup from the operator TOML, and the reviewer-only wire effort `reasoning = { "effort": … }` defaulting to `low`. The detailed selection, policy, per-batch and accounting rules are in [§9](#9-cpu-detection-and-target-selection), [§10](#10-isolated-qwen-review) and [§14](#14-bounded-resources-cancellation-and-failure).
+
+Exact original spans, mandatory pinned Pandoc, strict independent acceptance, one composed validation, admission, evidence quotas, envelopes and failure semantics are retained; any batch preparation/transport/structural/incomplete failure stops later batches and returns the completed original answer text (defined-location logprobs removal still applies), and the request-local ledger counts actual owned dispatch attempts 0..B with known-or-unknown aggregate usage. This is a D0 bounded policy change under the pinned order; the full change record is in [§18.5](#185-current-revision-23-2026-11-26), the change-control law in [§18](#18-change-control-and-revision-record).
 
 On this page: [Purpose](#1-purpose-and-scope) · [Boundary](#2-system-boundary) ·
 [Invariants](#3-fixed-product-invariants) · [Components](#4-components-and-module-ownership)
@@ -171,9 +155,9 @@ modules below are the current runtime boundaries in `concept-verification/`:
 | Cancellation | `request_lifecycle.py` | The one per-request scope over the exact accepted socket and its owned watcher |
 | Main hop | `upstream_setup.py`, `header_transport.py`, `capture_transport.py` | Upstream connection (owned resolver child for named hosts) and bounded complete capture before any repair |
 | Protection | `pandoc_protection.py` | The owned Pandoc child (pre-allocated `Popen`) and the granted/denied intervals; never renders the answer |
-| Detection | `runtime_detection.py` | Bounded original-coordinate targets |
+| Detection | `runtime_detection.py` | Bounded original-coordinate targets; the selection maximum is the length-scaled B × targets_per_call (no hidden fixed cap) |
 | Corpus | `runtime_corpus.py` | A strictly read-only index handle, opened only after the completed answer is admitted to analysis and closed on every path |
-| Review | `batch_review.py`, `review_transport.py` | The batch-v1 body and one outbound request (owned child/IPC transport); never writes files or mutates conversation state |
+| Review | `review_policy.py`, `batch_review.py`, `qwen_client.py`, `review_transport.py` | The immutable per-instance review policy (loaded once before listener/model/corpus work), the batch-v1 body and the sequential fresh batch requests (owned child/IPC transport carrying the configured caps); never writes files or mutates conversation state |
 | Acceptance and patch | `runtime_acceptance.py`, `composed_validation.py`, `repair.py` | Strict lexical acceptance, composed group recheck, exact patch |
 | Delivery | handler worker in `proxy.py` | The final response under the delivery budget; the only place that turns a cancellation into the quiet abort |
 
@@ -188,7 +172,7 @@ flowchart TD
     c["3 Cancellation scope<br/>over exact socket"]
     d["4 Main hop<br/>forward, bounded capture<br/>(stream: §5.3 early prefix)"]
     e["5 CPU analysis<br/>Pandoc spans, detection"]
-    f["6 Review hop<br/>one fresh batch, optional"]
+    f["6 Review hop<br/>sequential fresh batches, optional"]
     g["7 Acceptance and patch<br/>strict, exact spans"]
     h["8 Delivery<br/>bounded emission"]
     i["Read-only index"]
@@ -224,7 +208,7 @@ flowchart TD
     f["Main hop<br/>complete bounded capture<br/>(stream: proven reasoning prefix<br/>forwarded early, §5.3)"]
     c["Completed well-formed 200?"]
     p["Eligibility, Pandoc spans,<br/>bounded detection"]
-    r["Isolated batch-v1<br/>fresh strict-JSON request"]
+    r["Sequential isolated review batches<br/>fresh strict-JSON, ≤B calls"]
     a["Strict acceptance<br/>and composed validation"]
     d["Exact patch, logprobs removed,<br/>bounded delivery<br/>(stream: tail after sent prefix)"]
 
@@ -542,33 +526,83 @@ mode and produces **suspicion, not verdicts**. It works in four stages:
      points becomes one exact original slice; over 4 units or over 128 code
      points yields **no** targets, and the run's context-only units stay
      excluded.
-4. **Selection.** The runtime selects **at most four** non-overlapping targets
-   per answer (`REVIEW_BATCH_MAX_ITEMS = 4`), in deterministic original order
-   (hard cap 8 in the frozen selection; a safe non-positive maximum returns no
-   targets). This is the actual value; the old §14.1 eight-target figure was an
-   engineering proposal, not an implemented default.
+4. **Selection.** The runtime selects at most **B × T** non-overlapping
+   targets per answer in deterministic original order, where **B =
+   ceil(N / C)** is the length-scaled call allowance for the completed
+   eligible answer's code-point length **N** (0 for empty) against
+   **C = characters_per_call**, and **T = targets_per_call** (defaults
+   C = 1,024 and T = 4: one call per 1,024 code points, so B ≤ 32 and at
+   most 128 targets at the default analysis gate). B is a maximum: no
+   eligible suspicion means zero selected occurrences and zero review calls,
+   and an empty batch is never sent. The runnable path has **no hidden fixed
+   target cap** — the frozen historical `detector.py` contract is unchanged
+   and is not a production ceiling; a safe non-positive maximum returns no
+   targets.
 
 ## 10. Isolated Qwen review
 
-One **versioned, occurrence-addressed reviewer batch** (`batch-v1`) runs per
-completed eligible answer. It is a fresh, non-streaming request containing
-compact instructions (at most 8,192 code points) plus exactly one serialized
-JSON object of the targets and their bounded context (240 code points per
-side). The material is untrusted **data**, including any embedded instructions;
-there are no tools, no `previous_response_id`, no main-history linkage, and no
-recursion through the public repair endpoint. The batch request and response are
-each bounded to 32,768 bytes.
+Up to **B sequential versioned, occurrence-addressed reviewer batches**
+(`batch-v1`) run per completed eligible answer, where B is the length-scaled
+call allowance from §9. Each batch is a **fresh, isolated, non-streaming**
+same-model request containing the compact instructions plus exactly one
+serialized JSON object of that batch's targets and their bounded context; at
+most one batch is in flight, all batches refer to the **same immutable
+original** (never the progressively edited answer), and there is no retry,
+no second generative pass, no tools, no `previous_response_id`, no
+main-history linkage, and no recursion through the public repair endpoint.
+The material is untrusted **data**, including any embedded instructions.
+The whole occurrence set is prepared and validated against the immutable original before dispatch and partitioned into consecutive batches of at most `targets_per_call` with globally unique response-local ids and exact original-coordinate mapping.
 
-The reviewer must answer the agreed natural-appropriate-choice question and may
-`keep`, report a wider edit, or propose a more natural replacement. Strict
-parsing accepts one result shape per target id: `keep=true` implies
-`replacement=null`; `keep=false` implies a nonempty replacement and
-`needs_wider_edit=false`; `needs_wider_edit=true` implies `keep=true` and
-`replacement=null`. Invalid JSON, unknown/duplicate/missing ids, contradictory
-fields, or oversized output reject the whole batch; one structurally valid but
-unacceptable replacement is rejected individually during acceptance. The model
-returns only the local replacement, never a rewritten sentence or complete
-answer.
+The batch bounds are the configured review policy values (defaults in
+parentheses): prompt at most `max_prompt_codepoints` (8,192) code points,
+context `context_codepoints` (240) code points per side, output
+`max_output_tokens` (1,536) tokens, and request/response each bounded to
+`max_request_bytes` / `max_response_bytes` (32,768) bytes — positive
+integers up to the 4,294,967,295 transport framing limit. The configured
+byte caps reach **both** the parent checks and the owned child/IPC framing
+and read limits, not just the parent parsing. Each exchange has its own
+anchored absolute whole-exchange deadline: the file `timeout_seconds` (15.0 s
+default), with the legacy `CONCEPT_REVIEWER_TIMEOUT` environment override
+winning when set and validated equally before bind; the deadline is
+re-anchored per batch, and the summed per-batch waiting budget (at most
+B × timeout) is a summed per-call budget, not an overall request deadline.
+
+The policy is one **immutable per-instance** object of nine typed
+`[review]` fields, loaded once before any listener, model or corpus work from
+`CONCEPT_CONFIG` (when set) or ONLY the shipped adjacent
+`repair-proxy.toml` — no historical or directory search, no hot reload.
+Unknown sections/keys, missing/unreadable/malformed files (including invalid
+UTF-8), wrong types (bool-as-int included), nonpositive or nonfinite bounds
+and unknown effort names refuse startup with a fixed content-free reason,
+never echoing a value or credential. The SAME effective policy instance
+reaches the repair engine and the reviewer. Credentials, endpoints and
+profiles stay outside the policy; the existing endpoint/model/auth
+environment behavior is unchanged.
+
+Each batch request carries the reviewer-only wire field
+`reasoning = { "effort": … }` exactly as configured; the default is `low`.
+The standard names `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+`max` are validated locally; backend acceptance and interpretation are
+provider-dependent, and a rejected effort is never silently downgraded or
+omitted — the batch fails at the transport boundary instead. The runnable
+instruction makes the output format explicit (raw JSON only, no Markdown
+fences, preamble or commentary); the agreed natural-appropriate-choice
+question, the batch-v1 schema and every strict rejection rule are unchanged:
+`keep=true` implies `replacement=null`; `keep=false` implies a nonempty
+replacement and `needs_wider_edit=false`; `needs_wider_edit=true` implies
+`keep=true` and `replacement=null`. Invalid JSON, Markdown fences,
+unknown/duplicate/missing ids, contradictory fields, or oversized output
+reject the whole batch; one structurally valid but unacceptable replacement
+is rejected individually during acceptance. The model returns only the local
+replacement, never a rewritten sentence or complete answer.
+
+Any batch preparation, transport, structural or incomplete-response failure
+**stops later batches**, discards uncommitted proposals and returns the
+completed original answer text (the unconditional defined-location logprobs
+removal still applies). The fixed 128 code-point target/replacement bound,
+the 8 replacement-word bound, the 8,192 code-point proposal JSON bound and
+the independent CPU acceptance are structural safety constraints outside
+this operator change.
 
 ## 11. Strict acceptance
 
@@ -699,14 +733,17 @@ defaults; an invalid default fails startup before any bind allocation):
 | Main-upstream setup | `CONCEPT_SETUP_TIMEOUT` | 30 s | connect/TLS/upload before response |
 | Incoming-client intake | `CONCEPT_REQUEST_TIMEOUT` | 30 s | accepted-connection intake |
 | Final delivery | `CONCEPT_DELIVERY_TIMEOUT` | 30 s | response emission (streamed prefix: cumulative active client-write time; tail: fresh anchor) |
-| Reviewer whole exchange | `CONCEPT_REVIEWER_TIMEOUT` | 15 s | one monotonic batch deadline |
+| Reviewer whole exchange | file `timeout_seconds`; `CONCEPT_REVIEWER_TIMEOUT` override | 15 s | one monotonic deadline per batch, re-anchored per batch |
 | Accepted-connection admission | fixed | 1 active + 16 waiting, 2 s wait | admission queue |
 | Analysis eligibility | fixed | 32,768 code points / 131,072 UTF-8 bytes | optional analysis gate |
-| Reviewer batch | fixed | ≤4 targets, ≤128 target cp, 240 cp context, ≤8,192 prompt cp, ≤128 replacement cp, ≤1536 output tokens, ≤32,768 request/response bytes | batch bounds |
+| Reviewer batch | policy file (defaults shown) | ≤4 targets/call, 240 cp context, ≤8,192 prompt cp, ≤1,536 output tokens, ≤32,768 request/response bytes (1..4,294,967,295); fixed: ≤128 target cp, 8 replacement words, ≤128 replacement cp, 8,192 cp proposal JSON | batch bounds |
 | Pandoc | fixed | ≤1,000,000 input bytes, ≤32,000,000 output bytes, 10 s, finite node limits | structural protection |
 
 Overall request deadlines are not implemented; each phase clock is independent
-and increasing one does not increase the others or enable retries.
+and increasing one does not increase the others or enable retries. The
+summed per-batch review waiting budget is at most B × timeout (480 s at the
+default bounds) — a summed per-call budget, not total observed latency; main
+generation, CPU work, delivery and governed cleanup are separate.
 
 Cancellation targets **only request-owned work** and never creates an orphan
 repair:
@@ -731,13 +768,17 @@ main work**. The observed phase fixes what the abort prevents:
 | Cancellation observed | Guaranteed |
 | --- | --- |
 | Before the main forward | zero main and review work; quiet abort |
-| Before the review dispatch (only after completed main work) | no **new** reviewer work: no reviewer child starts and review calls are zero, while the already-captured main work stands |
+| Before a review batch dispatch (only after completed main work) | no **new** reviewer work: no later batch's reviewer child starts; already-attempted calls stay in the ledger, while the already-captured main work stands |
 | Mid-phase | the owned child is terminated and actually reaped; corpus and cursor closed; guards joined before the contained abort reaches the handler |
 
 An unread tail on a live peer never cancels (`POLLIN` is excluded from the
-watch mask). Request-local accounting emits exactly one content-free
-observation with the correct review-call count — at most one, for the single
-batch exchange — and known-or-unknown usage, even on abort, with no carryover.
+watch mask). Request-local accounting counts the **actual owned dispatch
+attempts** (0..B) at the real dispatch boundary and emits exactly one
+content-free observation with that count and known-or-unknown aggregate
+usage — known only while every attempted call has a completed result with
+validated usage, never partial-as-total or zero; a pre-dispatch failure adds
+no attempt and a cancellation between completed known calls retains the
+known aggregate — even on abort, with no carryover between requests.
 
 ## 15. Security, privacy and protected environment
 
@@ -846,4 +887,16 @@ runtime law, and never rewrite historical seeds to hide a revision.
 | Classification | D0 bounded compatibility bugfix under explicit owner instruction |
 | Scope | §5.3 lifecycle allowlist gains one proven minimal start-frame variant; complete-answer capture, strict acceptance, exact spans, the one-way buffer boundary and all other clauses unchanged |
 | Semantic delta | A top-level `response.created` / `response.in_progress` event whose event keys are exactly `type`/`response`/`sequence_number` (real nonnegative integer sequence number, a JSON boolean is not an integer) and whose response keys are exactly `id`/`object`/`status` (nonempty string `id`, `object` exactly `response`, `status` exactly `in_progress`) with `output` ABSENT (not null) is explicitly proven answer-free and forwards early; the shape is structural, never inferred from a provider or model name, `response.queued` is not covered, embedded carriers keep the general conservative rule, and absent `output` is never an empty output list. Motivating evidence is the actually observed V100 llama.cpp start frames: the unpatched repair proxy's classifier latched its one-way boundary at the first frame while the unrepaired route streamed (raw first reasoning at 0.436 s; a 128-token repaired-port probe released first reasoning at 3.5169 s / completion at 3.5187 s) — transport/shape evidence only, not linguistic-quality evidence and not an engine guarantee or runtime switch |
+| Projections | Compact architecture, distillation map, manifest and generated-file identities synchronized in the same PR against the trusted accepted base |
+
+### 18.5 Current revision (2.3, 2026-11-26)
+
+| Field | Value |
+| --- | --- |
+| Prior revision | 2.2, SHA-256 `6a93315cdbc24cee9124b7c187c4757f5531f3ee65be453d0db0471f511a35db` |
+| Accepted base | `d39361c4b8f93981436da76a4a77d8cf6b48396c` |
+| Authorization | Order 040-a (pinned immutable), explicit owner 2026-11-26 length-scaled review policy, operator TOML configuration and explicit low-default thinking instruction |
+| Classification | D0 under explicit owner product/resource/config decisions |
+| Scope | §4 module table and review-hop label; §5 lifecycle review-batch label; §9 selection allowance; §10 policy, sequential isolated batches, wire effort and per-batch bounds; §14 budgets/cancellation/accounting; new revision record; no change to exact-original spans, mandatory pinned Pandoc, strict independent acceptance, one composed pass, history/envelope/failure semantics, admission or protected resources |
+| Semantic delta | One frozen-original CPU pass with a length-scaled call allowance B = ceil(N / characters_per_call) (N = code points of the completed eligible original; 0 for empty; ≤32 at the default 32,768 cp analysis gate); CPU selection at most B × targets_per_call with no hidden fixed cap on the runnable path (frozen historical `detector.py` contract unchanged, not a production ceiling); the whole occurrence set is prepared and validated against the immutable original before dispatch, partitioned into consecutive batches of at most targets_per_call with globally unique response-local ids and exact original-coordinate mapping; up to B sequential fresh isolated same-model batch-v1 requests, at most one in flight, no retry or second generative pass; one immutable per-instance nine-field `[review]` policy (shipped adjacent `repair-proxy.toml` or `CONCEPT_CONFIG`, strict pre-bind validation without value/secret echo, no search or hot reload) with the SAME effective instance reaching engine and reviewer; each exchange keeps its own anchored absolute timeout (file `timeout_seconds`, legacy `CONCEPT_REVIEWER_TIMEOUT` environment override validated equally) plus configured prompt/output-token/request/response byte bounds that reach the parent checks AND the owned child/IPC framing and read limits (byte caps 1..4,294,967,295); reviewer-only wire `reasoning = { "effort": … }` exactly as configured (default `low`; standard names none/minimal/low/medium/high/xhigh/max, backend-dependent, never silently downgraded or omitted); raw-JSON output format explicit in the runnable instruction with the strict fenced/extra-output/schema rejection unchanged; any batch preparation/transport/structural/incomplete failure stops later batches and returns the completed original answer text (unconditional defined-location logprobs removal still applies); the request-local ledger counts actual owned dispatch attempts 0..B at the real dispatch boundary and the aggregate usage is known only when every attempted call has a completed result with validated usage (missing/invalid/failed stays unknown, never partial-as-total or zero; a pre-dispatch failure adds no attempt and retains earlier fully known cost; a cancellation between completed known calls retains the known aggregate); the fixed 128 cp target/replacement, 8 replacement-word and 8,192 cp proposal JSON bounds, the independent CPU acceptance, the 32,768 cp / 131,072 UTF-8 analysis gate, one-active admission and all evidence quotas are unchanged; at defaults the summed per-batch review waiting budget is at most B × timeout (480 s), a summed per-call budget, not total observed latency and not an overall request deadline |
 | Projections | Compact architecture, distillation map, manifest and generated-file identities synchronized in the same PR against the trusted accepted base |

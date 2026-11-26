@@ -28,6 +28,12 @@ configured as in INSTALL. Every main request carries the client's own upstream
 credential. Choose timeout values to suit the model; they are finite operational
 budgets, not a guarantee about response latency.
 
+`CONCEPT_REVIEWER_TIMEOUT=120` overrides only the `timeout_seconds` of the
+selected review policy file (environment > file) and is validated with the
+same rules before bind; the other review parameters (allowance, batch bounds,
+thinking effort) come from the policy file. See
+[INSTALL.md — Review policy configuration](../INSTALL.md#review-policy-configuration).
+
 Local clients use `http://127.0.0.1:18023/v1`; clients on other machines use
 `http://YOUR-PROXY-HOST:18023/v1`. For the existing three-hop stack:
 

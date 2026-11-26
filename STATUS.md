@@ -18,8 +18,9 @@ A **runnable loopback proxy** is implemented in `concept-verification/` (one
 Python 3.12 parent process on `127.0.0.1:18024` with bounded owned child
 processes): bounded admission, strict intake and
 request contract, bounded main capture, pinned-Pandoc 3.7.0.2 original-span
-protection, CPU detection, one optional isolated reviewer batch, strict lexical
-acceptance, exact patching and bounded delivery. The current architecture,
+protection, CPU detection, optional length-scaled sequential isolated
+reviewer batches, strict lexical acceptance, exact patching and bounded
+delivery. The current architecture,
 including budgets, cancellation and failure semantics, is in
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
