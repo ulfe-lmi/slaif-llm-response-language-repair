@@ -22,10 +22,14 @@ suspicion policy only, not a quality result):
    evidence dictionaries: no extra query, no re-query after a raw
    detect, no denominator/probability/entropy, no alternative-unigram
    inference, no automatic replacement.  Unigram-only mode gains no
-   context alarms.  Runtime maximum 4 / hard cap 8 with the frozen
-   deterministic selection; a safe non-positive maximum returns NO
-   targets.  RuntimeCorpus errors and caller control propagate to the
-   existing engine boundary untouched.
+   context alarms.  The caller passes the length-scaled selection
+   maximum (order 040-a, R2: B * targets_per_call); the deterministic
+   selection keeps scores, ranking, tie-breaking and non-overlap, and a
+   safe non-positive maximum returns NO targets.  No hidden fixed
+   target cap remains on the runnable path; the frozen historical
+   ``detector`` module and its contracts are untouched.
+   RuntimeCorpus errors and caller control propagate to the existing
+   engine boundary untouched.
 
    Before ANY target assignment - legacy candidates as well as context
    units and anchors - every unit must pass the shared lexical /
@@ -65,8 +69,8 @@ suspicion policy only, not a quality result):
    sub-run, never a fallback to component words.  After
    deduplication the complete phrase is preferred over overlapping
    context words by the unchanged bounded deterministic selection
-   (sort (-score, start, end), non-overlap, cap min(maximum, 8),
-   source-ordered output).  No reviewer-chosen offsets, extension or
+   (sort (-score, start, end), non-overlap, cap maximum, source-ordered
+   output).  No reviewer-chosen offsets, extension or
    second review; ranked alternatives are never sent to the reviewer.
 """
 
@@ -86,7 +90,6 @@ WORD_ALARM_SCORE = 0.4
 PHRASE_ALARM_SCORE = 0.45
 PHRASE_MAX_UNITS = 4
 PHRASE_MAX_CODEPOINTS = 128
-HARD_CAP = 8
 
 _HORIZONTAL_GAP = frozenset(" \t")
 
@@ -311,7 +314,9 @@ def detect(
     detector, plus the local-context-only fixed-anchor word alarms and
     grouped phrase targets.  One ``_evidence`` pass for ALL raw tokens
     in original order; the owned corpus keeps the exact SQL schedule
-    and nothing is re-queried.
+    and nothing is re-queried.  The selection maximum is the caller's
+    length-scaled allowance (order 040-a, R2); no hidden fixed cap is
+    applied on the runnable path.
     """
     if mode not in ("unigram-only", "local-context"):
         raise ValueError("unknown detector mode")
@@ -362,7 +367,7 @@ def detect(
             )
         ]
         candidates.extend(_group_candidates(text, tokens, alarm_indices, all_evidence))
-    cap = min(maximum, HARD_CAP)
+    cap = maximum
     if cap <= 0:
         return []
     candidates.sort(key=lambda item: (-item.score, item.start, item.end))

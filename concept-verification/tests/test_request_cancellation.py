@@ -2359,6 +2359,8 @@ class _ReviewExchangePreDispatchTests(unittest.TestCase):
             auth: str | None,
             remaining_seconds: float,
             body: bytes,
+            request_max_bytes: int,
+            response_max_bytes: int,
         ) -> bytes:
             # Transparent: the REAL codec runs to a valid frame; only
             # THEN is the phase-cancellation stimulus set - after the
@@ -2372,6 +2374,8 @@ class _ReviewExchangePreDispatchTests(unittest.TestCase):
                 auth=auth,
                 remaining_seconds=remaining_seconds,
                 body=body,
+                request_max_bytes=request_max_bytes,
+                response_max_bytes=response_max_bytes,
             )
             scope._cancelled.set()
             return frame

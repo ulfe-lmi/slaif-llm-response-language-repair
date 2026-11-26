@@ -15,7 +15,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
@@ -42,7 +42,6 @@ from batch_review import (
     BatchResult,
     BatchTarget,
     BatchUsage,
-    build_prompt,
     prepare_targets,
 )
 from config import (
@@ -51,7 +50,6 @@ from config import (
     MAIN_BODY_MAX_BYTES,
     MAIN_HEADER_TIMEOUT_SECONDS,
     MAIN_SETUP_TIMEOUT_SECONDS,
-    REVIEWER_HTTP_TIMEOUT_SECONDS,
     canonical_bytes,
 )
 from detector import Candidate, tokenize
@@ -72,6 +70,12 @@ from responses_contract import (
     remove_defined_logprobs,
     validate_completed_envelope,
     validate_request,
+)
+from review_policy import DEFAULT_POLICY, ReviewPolicy
+from review_policy import (
+    ReviewPolicyError,
+    load_review_policy,
+    validate_reviewer_timeout,
 )
 from runtime_acceptance import accept
 from runtime_corpus import RuntimeCorpus, RuntimeCorpusError
@@ -925,11 +929,38 @@ class RepairEngine:
     # Resolved qualified-Pandoc spec; None resolves lazily at repair time
     # (the proxy main path resolves and checks it at startup).
     pandoc: PandocSpec | None = None
+    # Configured review policy (order 040-a): the same typed immutable
+    # instance the normal entry point loaded once and also passed to
+    # the reviewer; direct core use keeps the shipped default file
+    # values.  It drives the length-scaled selection allowance, the
+    # batch size/context/prompt/output/request/response bounds and the
+    # whole-exchange timeout (already env-overridden at the entry
+    # point); it never touches main-request settings or the analysis
+    # gate.
+    policy: ReviewPolicy = DEFAULT_POLICY
     _details: list[dict[str, object]] | None = None
     # Actual reviewer usage for the in-flight request only; reset on every
     # request so no earlier usage is ever carried over (order 015-a,
-    # requirement 7).
+    # requirement 7).  Order 040-a, R6: the value is the aggregate
+    # over ALL attempted batches and stays known only while every
+    # attempted batch supplied validated usage - any missing/invalid
+    # usage or any failed batch keeps it explicitly unknown (None),
+    # never partial-as-total and never zero.
     _review_usage: BatchUsage | None = None
+    # Order 040-a, R6: sticky unknown - once ANY dispatched batch
+    # lacks validated usage (missing/invalid envelope usage, or a
+    # dispatched batch that failed), the aggregate is unknown for the
+    # whole request and never reverts to known, even if a later batch
+    # reports validated usage.  A pre-dispatch failure (no attempt, no
+    # token cost) does NOT set it.
+    _review_usage_sticky_unknown: bool = False
+    # Order 040-a, R6: batches that COMPLETED with a validated result
+    # (usage present or absent).  Compared against the actual
+    # attempted-dispatch ledger at observation time: a completed-known
+    # result count below the actual attempts (for example a
+    # mid-second-call cancellation) is unknown, never reported as the
+    # total.
+    _review_completed_calls: int = 0
     # The in-flight request's request-local cancellation scope
     # (order 030-a, requirement 1); None for direct core use, where
     # context-local access is a no-op.
@@ -945,6 +976,8 @@ class RepairEngine:
     ) -> None:
         self._details = []
         self._review_usage = None
+        self._review_usage_sticky_unknown = False
+        self._review_completed_calls = 0
         self._scope = scope
         self._usage_observed = False
 
@@ -953,6 +986,28 @@ class RepairEngine:
         # outside an active request scope.
         if self._scope is not None:
             self._scope.raise_if_cancelled()
+
+    def _known_review_usage(self, actual_attempts: int) -> BatchUsage | None:
+        """The authoritative known aggregate reviewer usage (order
+        040-a, R6), or explicit unknown.
+
+        Known only while ALL of: (a) no dispatched batch ever lacked
+        validated usage (the sticky unknown flag is clear - missing
+        envelope usage and dispatched-batch failure both set it and it
+        never reverts); (b) the completed-result count EQUALS the
+        actual attempted-dispatch count - a mid-second-call
+        cancellation or transport failure leaves a dispatched attempt
+        without a completed result, so an earlier completed known
+        result is never reported as the total, while a between-call
+        or pre-dispatch failure leaves the completed known aggregate
+        intact; and (c) the aggregate exists at all (zero attempts is
+        unknown, never zero).
+        """
+        if self._review_usage_sticky_unknown:
+            return None
+        if self._review_completed_calls != actual_attempts:
+            return None
+        return self._review_usage
 
     def abort_request(
         self, observer: Callable[[list[dict[str, object]]], None]
@@ -963,31 +1018,35 @@ class RepairEngine:
 
         The observation derives ONE authoritative record from the
         engine's own request-local state: the actual
-        attempted-dispatch count (zero for a pre-dispatch
-        cancellation, one when the owned reviewer exchange was
-        actually attempted) and the validated known-or-unknown
-        usage (a completed known result remains known through a
-        later CPU cancellation).  The text-bearing details are
-        drained and discarded - never re-aggregated (their
-        already-counted batches would double-count the actual
-        review work) and never observed, so the emitted record is
-        content-free.  An already-emitted observation is never
-        re-observed: exactly one operator record per request,
-        whichever boundary emits it first.  The request-local
-        state is always cleared, even if the operator callback
-        faults (the drain precedes the observer call).
+        attempted-dispatch count at the real owned dispatch
+        boundary (zero for a pre-dispatch cancellation; one per
+        owned exchange actually attempted, including a mid-second-
+        call cancellation or transport failure - order 040-a, R6)
+        and the validated known-or-unknown aggregate usage (a
+        completed known result remains known through a later CPU
+        cancellation; any missing/invalid usage or failed batch
+        keeps it unknown, never partial-as-total/zero).  The
+        text-bearing details are drained and discarded - never
+        re-aggregated (their already-counted batches would
+        double-count the actual review work) and never observed, so
+        the emitted record is content-free.  An already-emitted
+        observation is never re-observed: exactly one operator
+        record per request, whichever boundary emits it first.
+        The request-local state is always cleared, even if the
+        operator callback faults (the drain precedes the observer
+        call).
         """
         calls = (
-            1
+            self._scope.review_dispatch_attempts()
             if self._scope is not None
-            and self._scope.review_dispatch_attempted()
-            else 0
+            else self._review_completed_calls
         )
-        if self._review_usage is not None:
+        known = self._known_review_usage(calls)
+        if known is not None:
             usage: object = {
-                "input_tokens": self._review_usage.input_tokens,
-                "output_tokens": self._review_usage.output_tokens,
-                "total_tokens": self._review_usage.total_tokens,
+                "input_tokens": known.input_tokens,
+                "output_tokens": known.output_tokens,
+                "total_tokens": known.total_tokens,
             }
         else:
             usage = "unknown"
@@ -1233,7 +1292,21 @@ class RepairEngine:
             self._raise_if_cancelled()
             try:
                 detector_started = time.monotonic()
-                candidates = detect(text, corpus, intervals, mode=self.mode, maximum=4)
+                # Length-scaled selection maximum (order 040-a, R1/R2):
+                # B * targets_per_call with B = ceil(N / characters_
+                # per_call) on the ORIGINAL completed eligible answer
+                # (N code points).  The detector keeps its frozen
+                # deterministic scoring/ranking/tie-breaking/non-
+                # overlap selection; the obsolete hidden fixed cap is
+                # gone, and N=0 (no eligible suspicion possible)
+                # admits zero targets.
+                candidates = detect(
+                    text,
+                    corpus,
+                    intervals,
+                    mode=self.mode,
+                    maximum=self.policy.selection_maximum(len(text)),
+                )
             except RuntimeCorpusError as exc:
                 # Detection queried the index: same early boundary - exact
                 # completed original with zero edits and zero review calls.
@@ -1288,8 +1361,16 @@ class RepairEngine:
                         ),
                     )
                 )
-            # Bounded review budget: at most one fresh batch request per
-            # completed answer (order 014-a, requirements 2-4 and 7).
+            # Length-scaled bounded review budget (order 040-a,
+            # R1/R2): at most B = ceil(N / characters_per_call) fresh
+            # batch requests per completed eligible answer (N the
+            # ORIGINAL completed answer length in code points),
+            # covering at most B * targets_per_call selected
+            # occurrences.  These are maxima: no eligible suspicion
+            # means zero calls and an empty batch is never sent.  The
+            # analysis gate above already bounds the eligible
+            # original, so the default B stays at most 32; no hidden
+            # fixed target cap remains on the runnable path.
             review_batch: dict[str, object] = {
                 "calls": 0,
                 "targets": len(candidates) if selected_invalid else len(prepared),
@@ -1301,70 +1382,276 @@ class RepairEngine:
                 # never a zero and never an earlier request's usage.
                 "usage": "unknown",
             }
-            proposals: dict[str, BatchProposal] | None = None
+            # Per-batch ledger records (order 040-a, R6): one record
+            # per batch actually prepared/dispatched, in original
+            # order; the aggregate ``review_batch`` above summarizes
+            # them for the existing single-record interfaces.
+            review_batches: list[dict[str, object]] = []
+            # The response-wide proposal map: populated batch by batch
+            # and discarded (cleared) on any batch failure - uncommitted
+            # proposals are never applied or retained (order 040-a, R5).
+            proposals: dict[str, BatchProposal] = {}
             aligned: list[str] | None = None
             reviewer_seconds = 0.0
             if prepared and not selected_invalid:
+                policy = self.policy
                 occurrences = tuple(
                     (item.candidate.start, item.candidate.end, item.candidate.text)
                     for item in prepared
                 )
                 protected = tuple((item.start, item.end) for item in intervals)
-                targets = prepare_targets(text, occurrences, protected)
-                if targets is None:
-                    # Invalid/stale/protected/oversized batch preparation:
-                    # completed original with zero calls.
+                # Select/prepare ALL occurrences against the same
+                # immutable original BEFORE any dispatch: consecutive
+                # groups of policy.targets_per_call with response-local
+                # occurrence ids unique across batches and an exact
+                # batch-to-original mapping (order 040-a, R2); each
+                # occurrence is batched at most once, never re-detected
+                # on edited text.
+                # Response-wide selection validity gate (order 040-a,
+                # R2; established defensive preparation behavior): the
+                # COMPLETE occurrence list must stay within the length-
+                # scaled bound and be in deterministic original order,
+                # strictly non-overlapping, duplicate-free and exact
+                # against the immutable original ACROSS chunk
+                # boundaries - a stale/overlapping/out-of-order
+                # selection must not become valid merely because it
+                # straddles a chunk (the trusted detector returns
+                # globally ordered nonoverlapping results; this gate
+                # retains the old single-batch preparation validity at
+                # response scope).  Any violation returns the completed
+                # original with zero calls.
+                response_wide_valid = (
+                    len(occurrences) <= policy.selection_maximum(len(text))
+                )
+                previous_end = -1
+                seen_spans: set[tuple[int, int]] = set()
+                for start, end, target_text in occurrences:
+                    if (
+                        not isinstance(start, int)
+                        or isinstance(start, bool)
+                        or not isinstance(end, int)
+                        or isinstance(end, bool)
+                        or not isinstance(target_text, str)
+                        or start < 0
+                        or start >= end
+                        or end > len(text)
+                        or start < previous_end
+                        or (start, end) in seen_spans
+                        or text[start:end] != target_text
+                    ):
+                        response_wide_valid = False
+                        break
+                    previous_end = end
+                    seen_spans.add((start, end))
+                batches: list[tuple[BatchTarget, ...]] = []
+                prep_invalid = not response_wide_valid
+                if not prep_invalid:
+                    for offset in range(
+                        0, len(occurrences), policy.targets_per_call
+                    ):
+                        chunk = occurrences[
+                            offset : offset + policy.targets_per_call
+                        ]
+                        targets = prepare_targets(
+                            text, chunk, protected, policy, id_offset=offset
+                        )
+                        if targets is None:
+                            # Invalid/stale/protected/oversized preparation
+                            # of ANY occurrence: completed original with
+                            # zero calls, never a valid subset (order
+                            # 014-a, requirement 2).
+                            prep_invalid = True
+                            break
+                        batches.append(targets)
+                if prep_invalid:
+                    # No batch is dispatched; zero calls recorded.
                     review_batch["reason"] = REASON_PREP_INVALID
-                elif build_prompt(targets) is None:
-                    review_batch["targets"] = len(targets)
-                    review_batch["reason"] = REASON_PROMPT_OVERSIZE
                 else:
-                    batch_started = time.monotonic()
-                    try:
-                        batch_result = self.reviewer.review_batch(text, targets)
-                        proposals = batch_result.proposals
-                        self._review_usage = batch_result.usage
-                    except request_lifecycle.RequestCancelled:
-                        # A dedicated cancellation during the owned
-                        # exchange escapes to the handler (order
-                        # 030-a, requirements 4 and 6); it is never
-                        # a trusted failure label.
-                        raise
-                    except Exception as exc:
-                        # Only the closed vocabulary of fixed labels is
-                        # trusted; anything else maps to REVIEW_FAILED so
-                        # untrusted exception content never reaches traces.
-                        # (type guard first: an unhashable reason must not
-                        # raise inside this fallback path.)
-                        reason = getattr(exc, "reason", None)
-                        if type(reason) is not str or reason not in BOUND_REVIEW_REASONS:
-                            reason = REASON_FAILED
-                        review_batch["targets"] = len(targets)
-                        review_batch["outcome"] = "failed"
-                        review_batch["reason"] = reason
-                        review_batch["calls"] = (
+                    aligned = [
+                        target.id for batch in batches for target in batch
+                    ]
+                    review_batch["targets"] = len(aligned)
+
+                    def _dispatch_calls(
+                        before: int, reason: str | None
+                    ) -> int:
+                        """The actual attempted-dispatch ledger for one
+                        batch (order 040-a, R6): with an active scope
+                        the count is read at the real owned dispatch
+                        boundary (zero for a pre-dispatch failure, one
+                        when the owned exchange was actually attempted,
+                        including mid-call cancellation/transport
+                        failure); without a scope (direct core use) the
+                        closed reason labels keep the historical
+                        mapping."""
+                        if self._scope is not None:
+                            return self._scope.review_dispatch_attempts() - before
+                        if reason is None:
+                            return 1
+                        return (
                             0
-                            if reason in (REASON_PROMPT_OVERSIZE, REASON_REQUEST_OVERSIZE)
+                            if reason in (
+                                REASON_PROMPT_OVERSIZE,
+                                REASON_REQUEST_OVERSIZE,
+                            )
                             else 1
                         )
-                    else:
-                        aligned = [target.id for target in targets]
-                        review_batch["targets"] = len(targets)
-                        review_batch["outcome"] = "ok"
-                        review_batch["calls"] = 1
-                        # Actual reviewer usage, separately from main
-                        # usage; absence/invalidity stays unknown.
-                        review_batch["usage"] = (
-                            {
-                                "input_tokens": self._review_usage.input_tokens,
-                                "output_tokens": self._review_usage.output_tokens,
-                                "total_tokens": self._review_usage.total_tokens,
+
+                    batch_started = time.monotonic()
+                    try:
+                        for batch in batches:
+                            # Phase-boundary cancellation check before
+                            # each dispatch (order 030-a, R4): a
+                            # cancelled request starts no new reviewer
+                            # work.
+                            self._raise_if_cancelled()
+                            attempts_before = (
+                                self._scope.review_dispatch_attempts()
+                                if self._scope is not None
+                                else 0
+                            )
+                            record: dict[str, object] = {
+                                "calls": 0,
+                                "targets": len(batch),
+                                "outcome": "skipped",
+                                "reason": None,
+                                # Request-local default: explicit unknown
+                                # until this batch produces validated
+                                # usage; never a zero, never carried over.
+                                "usage": "unknown",
                             }
-                            if self._review_usage is not None
-                            else "unknown"
-                        )
+                            try:
+                                batch_result = self.reviewer.review_batch(
+                                    text, batch
+                                )
+                            except request_lifecycle.RequestCancelled:
+                                # A dedicated cancellation during the
+                                # owned exchange escapes to the handler
+                                # (order 030-a, requirements 4 and 6);
+                                # it is never a trusted failure label.
+                                raise
+                            except Exception as exc:
+                                # Only the closed vocabulary of fixed
+                                # labels is trusted; anything else maps
+                                # to REVIEW_FAILED so untrusted exception
+                                # content never reaches traces. (type
+                                # guard first: an unhashable reason must
+                                # not raise inside this fallback path.)
+                                reason = getattr(exc, "reason", None)
+                                if (
+                                    type(reason) is not str
+                                    or reason not in BOUND_REVIEW_REASONS
+                                ):
+                                    reason = REASON_FAILED
+                                record["outcome"] = "failed"
+                                record["reason"] = reason
+                                record["calls"] = _dispatch_calls(
+                                    attempts_before, reason
+                                )
+                                review_batches.append(record)
+                                # Any batch failure stops later batches
+                                # and discards uncommitted proposals:
+                                # the completed original is delivered
+                                # (order 040-a, R5).  The aggregate usage
+                                # is explicitly unknown from here on -
+                                # never partial-as-total and never zero,
+                                # and a failure before another dispatch
+                                # adds no fake attempt/token cost.
+                                aligned = None
+                                proposals.clear()
+                                # A DISPATCHED failure (an actual attempt
+                                # without a completed result) makes the
+                                # aggregate sticky unknown - never
+                                # partial-as-total and never zero; a
+                                # PRE-DISPATCH failure is not an attempt
+                                # (no fake attempt or token cost) and
+                                # leaves any completed known aggregate
+                                # for the earlier attempted call intact
+                                # (order 040-a, R6).
+                                if record["calls"]:
+                                    self._review_usage_sticky_unknown = True
+                                    self._review_usage = None
+                                review_batch["outcome"] = "failed"
+                                review_batch["reason"] = reason
+                                break
+                            else:
+                                record["outcome"] = "ok"
+                                record["calls"] = _dispatch_calls(
+                                    attempts_before, None
+                                )
+                                # One completed result (order 040-a, R6):
+                                # counted whether or not its envelope
+                                # usage is validated.
+                                self._review_completed_calls += 1
+                                # Actual reviewer usage, separately from
+                                # main usage.  A dispatched batch without
+                                # validated usage makes the aggregate
+                                # sticky unknown - never partial-as-total,
+                                # never reverted to known by a later
+                                # batch.
+                                if batch_result.usage is not None:
+                                    record["usage"] = {
+                                        "input_tokens": (
+                                            batch_result.usage.input_tokens
+                                        ),
+                                        "output_tokens": (
+                                            batch_result.usage.output_tokens
+                                        ),
+                                        "total_tokens": (
+                                            batch_result.usage.total_tokens
+                                        ),
+                                    }
+                                    aggregate = self._review_usage
+                                    if aggregate is not None:
+                                        self._review_usage = BatchUsage(
+                                            aggregate.input_tokens
+                                            + batch_result.usage.input_tokens,
+                                            aggregate.output_tokens
+                                            + batch_result.usage.output_tokens,
+                                            aggregate.total_tokens
+                                            + batch_result.usage.total_tokens,
+                                        )
+                                    else:
+                                        self._review_usage = batch_result.usage
+                                else:
+                                    self._review_usage_sticky_unknown = True
+                                    self._review_usage = None
+                                proposals.update(batch_result.proposals)
+                                review_batches.append(record)
                     finally:
                         reviewer_seconds = time.monotonic() - batch_started
+                    # The aggregate call count is the actual
+                    # attempted-dispatch ledger across all batches
+                    # (order 040-a, R6).
+                    review_batch["calls"] = sum(
+                        record["calls"] for record in review_batches
+                    )
+                    # The authoritative known aggregate is serialized
+                    # INDEPENDENTLY OF THE REPAIR OUTCOME (order 040-a,
+                    # R6): known only when the completed-result count
+                    # equals the actual dispatch ledger and no
+                    # dispatched batch lacked validated usage - so a
+                    # failed or pre-dispatch-stopped review whose
+                    # actual attempted calls all supplied validated
+                    # usage still reports that known cost (a late
+                    # pre-dispatch failure adds no fake attempt and
+                    # does not erase earlier known usage), while any
+                    # dispatched loss stays unknown, never partial-
+                    # as-total and never zero.
+                    attempts = (
+                        self._scope.review_dispatch_attempts()
+                        if self._scope is not None
+                        else review_batch["calls"]
+                    )
+                    known = self._known_review_usage(attempts)
+                    if known is not None:
+                        review_batch["usage"] = {
+                            "input_tokens": known.input_tokens,
+                            "output_tokens": known.output_tokens,
+                            "total_tokens": known.total_tokens,
+                        }
+                    if aligned is not None:
+                        review_batch["outcome"] = "ok"
             decisions: list[dict[str, object]] = []
             edits: list[tuple[int, int, str]] = []
             composed_records: list[composed_validation.ComposedRecord] = []
@@ -1623,6 +1910,7 @@ class RepairEngine:
                     },
                     "protected_difference_count": protected_changes,
                     "review_batch": review_batch,
+                    "review_batches": review_batches,
                 }
             if late_aborted:
                 # Recorded with the actual review attempt preserved (calls
@@ -3145,6 +3433,19 @@ def main() -> int:
     index = os.environ.get("CONCEPT_INDEX")
     if not index:
         raise SystemExit("CONCEPT_INDEX is required")
+    # Configurable length-scaled review policy (order 040-a, R3):
+    # canonical operator selection CONCEPT_CONFIG (explicit supplied
+    # path) or ONLY the shipped adjacent file - never historical or
+    # directory searching, no hot reload.  The file is loaded and
+    # strictly validated BEFORE any listener/model/corpus work: a
+    # missing/unreadable/malformed file, unknown sections/keys, wrong
+    # types (including bool-as-int), zero/negative/nonfinite numeric
+    # bounds or an unknown effort name refuses startup with a fixed
+    # content-free reason, without echoing any value or credential.
+    try:
+        policy = load_review_policy()
+    except ReviewPolicyError as exc:
+        raise SystemExit(str(exc)) from None
     # Mandatory qualified-Pandoc startup check (order 013-a, requirements 2
     # and 12): executable presence, exact version and reader capability,
     # verified before the proxy accepts any traffic (before the HTTP bind).
@@ -3165,24 +3466,40 @@ def main() -> int:
     # separate axes and must not extend reviewer calls (order 014-a,
     # requirement 4).
     # One explicit operator setting for the reviewer ONLY (order
-    # 031-b, requirement 4): CONCEPT_REVIEWER_TIMEOUT.  Absent, the
-    # named REVIEWER_HTTP_TIMEOUT_SECONDS constant and its 15-second
-    # default are unchanged.  Present, the value is parsed here,
-    # before any HTTP bind, and validated by the existing
-    # ResponsesReviewer constructor, which rejects nonnumeric,
-    # nonpositive, NaN or infinite durations before bind; the
-    # selected value keeps the one absolute whole-exchange clock
-    # semantics and is not coupled to the other independent budgets
-    # (no retry, extra pass, changed token cap, global HTTP clock or
-    # request/header override).
-    reviewer_timeout: float = REVIEWER_HTTP_TIMEOUT_SECONDS
-    if os.environ.get("CONCEPT_REVIEWER_TIMEOUT") is not None:
-        reviewer_timeout = float(os.environ["CONCEPT_REVIEWER_TIMEOUT"])
+    # 031-b, requirement 4; order 040-a, R3 precedence): the legacy
+    # CONCEPT_REVIEWER_TIMEOUT remains the SOLE legacy timeout
+    # override, environment override > selected/shipped file, and is
+    # validated EQUALLY before any bind - a nonnumeric, nonpositive,
+    # NaN, infinite or overflowing duration refuses startup with a
+    # fixed content-free reason, never a raw decode crash.  Absent,
+    # the selected file's timeout_seconds (shipped default 15 s)
+    # governs.  The selected value keeps the one absolute
+    # whole-exchange clock semantics per batch and is not coupled to
+    # the other independent budgets (no retry, extra pass, changed
+    # token cap, global HTTP clock or request/header override).
+    raw_reviewer_timeout = os.environ.get("CONCEPT_REVIEWER_TIMEOUT")
+    if raw_reviewer_timeout is not None:
+        try:
+            reviewer_timeout = validate_reviewer_timeout(
+                float(raw_reviewer_timeout)
+            )
+        except (ValueError, OverflowError, ReviewPolicyError):
+            raise SystemExit(
+                "CONCEPT_REVIEWER_TIMEOUT must be a finite positive duration"
+            ) from None
+    else:
+        reviewer_timeout = policy.timeout_seconds
+    # The SAME immutable policy instance (with the effective timeout)
+    # is shared by the reviewer and the engine below (order 040-a
+    # interface checkpoint): the file values flow to the real
+    # runtime, not just parsed/echoed.
+    policy = replace(policy, timeout_seconds=reviewer_timeout)
     reviewer = ResponsesReviewer(
         os.environ.get("CONCEPT_REVIEWER_URL", "http://127.0.0.1:8001/v1"),
         os.environ.get("CONCEPT_REVIEWER_MODEL", "Qwen3.8-27B"),
         timeout=reviewer_timeout,
         profile=os.environ.get("CONCEPT_REVIEWER_PROFILE"),
+        policy=policy,
     )
     trace_value = os.environ.get("CONCEPT_TRACE_DIR")
     # Operator-observable separated review usage (order 015-a,
@@ -3237,7 +3554,13 @@ def main() -> int:
     proxy = ConceptProxy(
         (host, port),
         upstream,
-        RepairEngine(Path(index), reviewer, pandoc=pandoc_spec),
+        # The SAME immutable policy instance loaded once above reaches
+        # BOTH the reviewer (constructed above) and the engine (order
+        # 040-a interface checkpoint); no second independent policy
+        # exists at the server.
+        RepairEngine(
+            Path(index), reviewer, pandoc=pandoc_spec, policy=policy
+        ),
         header_timeout=float(
             os.environ.get(
                 "CONCEPT_HEADER_TIMEOUT", str(MAIN_HEADER_TIMEOUT_SECONDS)

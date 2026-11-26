@@ -24,6 +24,7 @@ import threading
 import time
 import unittest
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import cast
@@ -250,12 +251,22 @@ class BuildPromptTests(unittest.TestCase):
         value = json.loads(body)
         self.assertEqual(
             set(value),
-            {"model", "stream", "store", "max_output_tokens", "input"},
+            {
+                "model",
+                "stream",
+                "store",
+                "max_output_tokens",
+                "reasoning",
+                "input",
+            },
         )
         self.assertEqual(value["model"], "test-model")
         self.assertIs(value["stream"], False)
         self.assertIs(value["store"], False)
         self.assertEqual(value["max_output_tokens"], 1536)
+        # The default wire field is exactly the configured low effort
+        # (order 040-a, R4).
+        self.assertEqual(value["reasoning"], {"effort": "low"})
         self.assertEqual(value["input"], [
             {"role": "user", "content": [{"type": "input_text", "text": prompt}]}
         ])
@@ -572,8 +583,16 @@ class TransportTests(unittest.TestCase):
 
     def test_request_oversize_fails_before_dispatch(self) -> None:
         big = (BatchTarget("t0", "\U0001F600" * 8000, "b", "", True, True),)
+        # The prompt bound is now a configured policy value: widen the
+        # code-point axis so the byte axis is what fails before
+        # dispatch.
+        policy = replace(
+            self.reviewer.policy,
+            max_prompt_codepoints=10**9,
+            max_request_bytes=100,
+        )
         with mock.patch.object(
-            batch_review, "REVIEW_BATCH_MAX_PROMPT_CODEPOINTS", 10**9
+            self.reviewer, "policy", policy
         ), self.assertRaises(ReviewerError) as ctx:
             self.reviewer.review_batch(TEXT, big)
         self.assertEqual(ctx.exception.reason, REASON_REQUEST_OVERSIZE)
@@ -914,20 +933,27 @@ class EngineBatchTests(unittest.TestCase):
         )
 
     def test_prompt_oversize_returns_original_without_calls(self) -> None:
-        reviewer = _ScriptedBatchReviewer(_replace_all)
+        # Prompt construction is owned by the real reviewer (order
+        # 040-a): the engine observes the closed pre-dispatch label the
+        # way the real ResponsesReviewer raises it before any transport
+        # attempt - no counted call, no later batch, original returned.
+        def responder(
+            sentence: str, targets: tuple[BatchTarget, ...]
+        ) -> dict[str, BatchProposal]:
+            raise ReviewerError("synthetic failure", reason=REASON_PROMPT_OVERSIZE)
+
+        reviewer = _ScriptedBatchReviewer(responder)
         engine = self._engine(reviewer)
         engine.begin_request()
-        with mock.patch.object(self.proxy_module, "build_prompt", lambda targets: None):
-            self.assertEqual(engine.repair(TEXT), TEXT)
-        self.assertEqual(reviewer.calls, 0)
+        self.assertEqual(engine.repair(TEXT), TEXT)
         details = engine.take_details()
         batch = cast(dict[str, object], details[0]["review_batch"])
         self.assertEqual(
             batch,
             {
-"calls": 0,
+                "calls": 0,
                 "targets": 2,
-                "outcome": "skipped",
+                "outcome": "failed",
                 "reason": REASON_PROMPT_OVERSIZE,
                 "usage": "unknown",
             },
@@ -2692,8 +2718,10 @@ class ReviewerTimeoutTests(unittest.TestCase):
                 timeout: float = 15.0,
                 api_key: str | None = None,
                 profile: object = None,
+                policy: object = None,
             ) -> None:
                 captured["timeout"] = timeout
+                captured["policy"] = policy
 
         class _ProbeProxy:
             def __init__(self, *args: object, **kwargs: object) -> None:
@@ -2713,6 +2741,8 @@ class ReviewerTimeoutTests(unittest.TestCase):
         ):
             proxy.main()
         self.assertEqual(captured["timeout"], 15.0)
+        # The shared policy instance is wired, not dropped.
+        self.assertIsNotNone(captured["policy"])
 
 
 if __name__ == "__main__":

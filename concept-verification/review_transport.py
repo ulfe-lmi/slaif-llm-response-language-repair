@@ -59,7 +59,7 @@ from config import (
     REVIEW_BATCH_MAX_RESPONSE_BYTES,
 )
 
-REVIEW_TRANSPORT_VERSION = 1
+REVIEW_TRANSPORT_VERSION = 2
 
 # Finite IPC caps (order 019-a, requirement 3).  The request body cap
 # and response payload cap are the existing batch bounds; the address
@@ -78,12 +78,21 @@ _AUTH_MAX_BYTES = 4096
 _BODY_MAX_BYTES = REVIEW_BATCH_MAX_REQUEST_BYTES
 _PAYLOAD_MAX_BYTES = REVIEW_BATCH_MAX_RESPONSE_BYTES
 
-_REQUEST_HEADER = struct.Struct(">4sBBBHHIIdI")
+#: Version 2 (order 040-a, R3/R4 clarification): the request frame
+#: carries the ACTUAL configured byte caps so the owned child/IPC
+#: framing and read limits enforce the file-configured bounds instead
+#: of hidden fixed defaults; the child bounds its reads from the
+#: frame's own validated header fields, never from an untrusted
+#: prefix length alone.  Ownership, reap, deadline and cancellation
+#: semantics are unchanged.
+_REQUEST_HEADER = struct.Struct(">4sBBBHHIIdIII")
 _RESPONSE_HEADER = struct.Struct(">4sBBBHI")
 _FRAME_PREFIX = struct.Struct(">Q")
 
 _REQUEST_FIXED_BYTES = _REQUEST_HEADER.size
 _RESPONSE_FIXED_BYTES = _RESPONSE_HEADER.size
+#: Legacy default-policy caps (kept for direct unit use); the real
+#: runtime path always passes the configured values explicitly.
 REQUEST_FRAME_MAX_BYTES = (
     _REQUEST_FIXED_BYTES
     + _HOST_MAX_BYTES
@@ -97,6 +106,20 @@ RESPONSE_FRAME_MAX_BYTES = _RESPONSE_FIXED_BYTES + _PAYLOAD_MAX_BYTES + 1
 # child; finite and honestly accounted, not a deadline extension.
 _CLEANUP_SLICE_SECONDS = 0.5
 _CLEANUP_POLL_SECONDS = 0.05
+
+#: Finite 32-bit unsigned bound for caps carried in the frame (order
+#: 040-a): the structured field admits at most this value, and the
+#: startup policy validation applies the same bound.
+_CAP_MAX = 0xFFFF_FFFF
+
+
+def _validate_cap(value: object, what: str) -> int:
+    # Exact positive int (bool rejected), bounded by the 32-bit frame
+    # field; a nonconforming cap is a contract violation, never a
+    # silent fallback to a fixed default.
+    if type(value) is not int or value <= 0 or value > _CAP_MAX:
+        raise FrameMalformed(f"reviewer {what} is not a valid byte cap")
+    return value
 
 
 class ReviewTransportError(ValueError):
@@ -130,7 +153,14 @@ class ProcessFailure(Exception):
 
 @dataclass(frozen=True)
 class ReviewRequest:
-    """One decoded request frame (explicit runtime fields only)."""
+    """One decoded request frame (explicit runtime fields only).
+
+    ``request_max_bytes`` / ``response_max_bytes`` are the configured
+    caps carried in the frame (order 040-a, R3/R4 clarification): the
+    child bounds its request-body acceptance and its HTTP response read
+    with them, so the file-configured limits reach the owned child/IPC
+    framing and read limits, not just the parent checks.
+    """
 
     scheme: str
     host: str
@@ -139,6 +169,8 @@ class ReviewRequest:
     auth: str | None
     remaining_seconds: float
     body: bytes
+    request_max_bytes: int
+    response_max_bytes: int
 
 
 @dataclass(frozen=True)
@@ -148,6 +180,35 @@ class ReviewResponse:
     ok: bool
     http_status: int
     payload: bytes
+
+
+@dataclass(frozen=True)
+class _RequestHeaderInfo:
+    """Validated request-header fields before the body is read.
+
+    The child uses ``total_frame_bytes`` to bound its reads from the
+    frame's own validated header (bounded host/path/auth lengths and a
+    body no larger than the frame's own configured request cap) instead
+    of trusting the untrusted prefix length alone.
+    """
+
+    host_len: int
+    path_len: int
+    auth_len: int
+    body_len: int
+    request_max_bytes: int
+    response_max_bytes: int
+
+    @property
+    def total_frame_bytes(self) -> int:
+        return (
+            _FRAME_PREFIX.size
+            + _REQUEST_FIXED_BYTES
+            + self.host_len
+            + self.path_len
+            + self.auth_len
+            + self.body_len
+        )
 
 
 def _decode_utf8_bounded(data: bytes, limit: int, what: str) -> str:
@@ -168,15 +229,22 @@ def encode_request_frame(
     auth: str | None,
     remaining_seconds: float,
     body: bytes,
+    request_max_bytes: int = _BODY_MAX_BYTES,
+    response_max_bytes: int = _PAYLOAD_MAX_BYTES,
 ) -> bytes:
     """Encode one strict versioned request frame (wire-ready).
 
     ``port`` keeps the full 16-bit meaning: ``None`` encodes the
     default port as 0 and an explicit port must be 1-65535; an
-    explicit 0 is rejected, never aliased to the default.
+    explicit 0 is rejected, never aliased to the default.  The
+    configured byte caps (order 040-a, R3/R4 clarification) are
+    validated and carried in the frame so the owned child enforces
+    them; the defaults are the shipped policy's bounds.
     """
     if scheme not in ("http", "https"):
         raise FrameMalformed("reviewer scheme is invalid")
+    request_max = _validate_cap(request_max_bytes, "request byte cap")
+    response_max = _validate_cap(response_max_bytes, "response byte cap")
     host_bytes = host.encode("utf-8")
     if len(host_bytes) > _HOST_MAX_BYTES:
         raise FrameMalformed("reviewer host exceeds bound")
@@ -190,7 +258,7 @@ def encode_request_frame(
             raise FrameMalformed("reviewer credential field exceeds bound")
     if not math.isfinite(remaining_seconds) or remaining_seconds <= 0:
         raise FrameMalformed("reviewer remaining time is not finite positive")
-    if len(body) > _BODY_MAX_BYTES:
+    if len(body) > request_max:
         raise FrameMalformed("reviewer request body exceeds bound")
     if port is None:
         port_byte = 0
@@ -209,17 +277,29 @@ def encode_request_frame(
         len(auth_bytes),
         remaining_seconds,
         len(body),
+        request_max,
+        response_max,
     )
     frame = header + host_bytes + path_bytes + auth_bytes + body
-    assert len(frame) <= REQUEST_FRAME_MAX_BYTES
+    assert len(frame) <= (
+        _REQUEST_FIXED_BYTES
+        + _HOST_MAX_BYTES
+        + _PATH_MAX_BYTES
+        + _AUTH_MAX_BYTES
+        + request_max
+    )
     return _FRAME_PREFIX.pack(len(frame)) + frame
 
 
-def decode_request_frame(frame: bytes) -> ReviewRequest:
-    """Strictly decode one request frame; reject any deviation."""
-    if len(frame) > REQUEST_FRAME_MAX_BYTES:
-        raise FrameMalformed("reviewer request frame exceeds bound")
-    if len(frame) < _REQUEST_FIXED_BYTES:
+def decode_request_header(header: bytes) -> _RequestHeaderInfo:
+    """Strictly validate one request frame's header bytes (no body).
+
+    The child calls this BEFORE reading the body so the remaining read
+    is bounded by the frame's own validated fields (order 040-a,
+    R3/R4 clarification); a corrupted or oversized declaration is a
+    contract violation, never an unbounded read.
+    """
+    if len(header) != _REQUEST_FIXED_BYTES:
         raise FrameMalformed("reviewer request frame is truncated")
     (
         magic,
@@ -232,6 +312,66 @@ def decode_request_frame(frame: bytes) -> ReviewRequest:
         auth_len,
         remaining_seconds,
         body_len,
+        request_max,
+        response_max,
+    ) = _REQUEST_HEADER.unpack_from(header, 0)
+    if (
+        magic != _MAGIC
+        or version != REVIEW_TRANSPORT_VERSION
+        or kind != _KIND_REQUEST
+    ):
+        raise FrameMalformed("reviewer request frame identity is invalid")
+    if host_len > _HOST_MAX_BYTES:
+        raise FrameMalformed("reviewer host exceeds bound")
+    if path_len > _PATH_MAX_BYTES:
+        raise FrameMalformed("reviewer path exceeds bound")
+    if auth_len > _AUTH_MAX_BYTES:
+        raise FrameMalformed("reviewer credential field exceeds bound")
+    if not math.isfinite(remaining_seconds) or remaining_seconds <= 0:
+        raise FrameMalformed("reviewer remaining time is not finite positive")
+    request_max = _validate_cap(request_max, "request byte cap")
+    response_max = _validate_cap(response_max, "response byte cap")
+    if body_len > request_max:
+        raise FrameMalformed("reviewer request body exceeds bound")
+    if scheme_byte not in (_SCHEME_HTTP, _SCHEME_HTTPS):
+        raise FrameMalformed("reviewer scheme is invalid")
+    return _RequestHeaderInfo(
+        host_len, path_len, auth_len, body_len, request_max, response_max
+    )
+
+
+def decode_request_frame(frame: bytes) -> ReviewRequest:
+    """Strictly decode one request frame; reject any deviation.
+
+    The absolute frame bound is derived from the frame's own validated
+    header (embedded configured caps), so a nondefault configured cap
+    is enforced end to end (order 040-a, R3/R4 clarification).
+    """
+    if len(frame) < _REQUEST_FIXED_BYTES:
+        raise FrameMalformed("reviewer request frame is truncated")
+    info = decode_request_header(frame[:_REQUEST_FIXED_BYTES])
+    if (
+        len(frame)
+        > _REQUEST_FIXED_BYTES
+        + _HOST_MAX_BYTES
+        + _PATH_MAX_BYTES
+        + _AUTH_MAX_BYTES
+        + info.request_max_bytes
+    ):
+        raise FrameMalformed("reviewer request frame exceeds bound")
+    (
+        magic,
+        version,
+        kind,
+        scheme_byte,
+        port_byte,
+        host_len,
+        path_len,
+        auth_len,
+        remaining_seconds,
+        body_len,
+        request_max,
+        response_max,
     ) = _REQUEST_HEADER.unpack_from(frame, 0)
     if (
         magic != _MAGIC
@@ -259,7 +399,7 @@ def decode_request_frame(frame: bytes) -> ReviewRequest:
     body = frame[offset : offset + body_len]
     if len(body) != body_len:
         raise FrameMalformed("reviewer request frame body is truncated")
-    if len(body) > _BODY_MAX_BYTES:
+    if len(body) > request_max:
         raise FrameMalformed("reviewer request body exceeds bound")
     return ReviewRequest(
         scheme="https" if scheme_byte == _SCHEME_HTTPS else "http",
@@ -269,15 +409,27 @@ def decode_request_frame(frame: bytes) -> ReviewRequest:
         auth=auth,
         remaining_seconds=remaining_seconds,
         body=body,
+        request_max_bytes=request_max,
+        response_max_bytes=response_max,
     )
 
 
-def encode_response_frame(*, ok: bool, http_status: int, payload: bytes) -> bytes:
-    """Encode one strict versioned response frame (wire-ready)."""
+def encode_response_frame(
+    *, ok: bool, http_status: int, payload: bytes, payload_max_bytes: int = _PAYLOAD_MAX_BYTES
+) -> bytes:
+    """Encode one strict versioned response frame (wire-ready).
+
+    ``payload_max_bytes`` is the configured response bound (order
+    040-a, R3/R4 clarification): the child over-reads by exactly one
+    byte to detect a declared delivery past the bound, and a payload
+    beyond ``payload_max_bytes`` is a contract violation, never a
+    silent fixed-cap truncation.
+    """
+    payload_max = _validate_cap(payload_max_bytes, "response byte cap")
     if not ok:
         http_status = 0
         payload = b""
-    elif not 0 <= http_status <= 0xFFFF or len(payload) > _PAYLOAD_MAX_BYTES + 1:
+    elif not 0 <= http_status <= 0xFFFF or len(payload) > payload_max + 1:
         raise FrameMalformed("reviewer response fields exceed bound")
     header = _RESPONSE_HEADER.pack(
         _MAGIC,
@@ -288,13 +440,20 @@ def encode_response_frame(*, ok: bool, http_status: int, payload: bytes) -> byte
         len(payload),
     )
     frame = header + payload
-    assert len(frame) <= RESPONSE_FRAME_MAX_BYTES
+    assert len(frame) <= _RESPONSE_FIXED_BYTES + payload_max + 1
     return _FRAME_PREFIX.pack(len(frame)) + frame
 
 
-def decode_response_frame(frame: bytes) -> ReviewResponse:
-    """Strictly decode one response frame; reject any deviation."""
-    if len(frame) > RESPONSE_FRAME_MAX_BYTES:
+def decode_response_frame(
+    frame: bytes, payload_max_bytes: int = _PAYLOAD_MAX_BYTES
+) -> ReviewResponse:
+    """Strictly decode one response frame; reject any deviation.
+
+    The absolute frame bound is the configured response cap plus the
+    one-byte over-read marker (order 040-a, R3/R4 clarification).
+    """
+    payload_max = _validate_cap(payload_max_bytes, "response byte cap")
+    if len(frame) > _RESPONSE_FIXED_BYTES + payload_max + 1:
         raise FrameMalformed("reviewer response frame exceeds bound")
     if len(frame) < _RESPONSE_FIXED_BYTES:
         raise FrameMalformed("reviewer response frame is truncated")
@@ -470,6 +629,8 @@ def run_review_exchange(
     auth: str | None,
     deadline: float,
     worker_path: Path,
+    request_max_bytes: int = _BODY_MAX_BYTES,
+    response_max_bytes: int = _PAYLOAD_MAX_BYTES,
 ) -> tuple[int, bytes]:
     """Run one owned-child reviewer exchange under an absolute deadline.
 
@@ -488,8 +649,22 @@ def run_review_exchange(
     :class:`ReviewTransportError` with the fixed transport label on
     deadline expiry, malformed/oversized/incomplete/extra replies,
     nonzero child exit, spawn failure or child transport failure
-    (no automatic retry; order 019-a, requirement 2).
+    (no automatic retry; order 019-a, requirement 2).  The configured
+    byte caps (order 040-a, R3/R4 clarification) are validated here,
+    carried in the request frame and enforced by the owned child's
+    request framing, response read limit, response framing and the
+    parent's final decode.
     """
+    try:
+        request_max = _validate_cap(request_max_bytes, "request byte cap")
+        response_max = _validate_cap(response_max_bytes, "response byte cap")
+    except FrameMalformed as exc:
+        # A nonconforming configured cap is a contract violation with
+        # the fixed transport label; the startup policy validation
+        # already fails before bind on the real path.
+        raise ReviewTransportError(
+            "review HTTP request failed", reason=REASON_HTTP_FAILED
+        ) from exc
     if not math.isfinite(deadline):
         raise ReviewTransportError(
             "reviewer exchange deadline is not finite", reason=REASON_HTTP_FAILED
@@ -508,6 +683,8 @@ def run_review_exchange(
         auth=auth,
         remaining_seconds=deadline - time.monotonic(),
         body=body,
+        request_max_bytes=request_max,
+        response_max_bytes=response_max,
     )
     # Request-local attempted-dispatch marker (order 030-a,
     # requirement 7): set on the parent side AFTER the pure
@@ -608,7 +785,10 @@ def run_review_exchange(
         os.close(request_write)
         request_write = -1
         reply = _read_frame_governed(
-            response_read, RESPONSE_FRAME_MAX_BYTES, deadline, cancelled
+            response_read,
+            _RESPONSE_FIXED_BYTES + response_max + 1,
+            deadline,
+            cancelled,
         )
         # Strict single-frame check: exactly one frame, then the pipe
         # ends; any extra byte is a malformed reply.
@@ -622,7 +802,9 @@ def run_review_exchange(
         code = _wait_exit_governed(proc, deadline, cancelled)
         if code != 0:
             raise ProcessFailure("owned reviewer child exited nonzero")
-        response = decode_response_frame(reply)
+        response = decode_response_frame(
+            reply, payload_max_bytes=response_max
+        )
         # Expiry is checked after completion: a racing or late valid
         # frame loses to the deadline and is never transferred.
         if time.monotonic() >= deadline:
