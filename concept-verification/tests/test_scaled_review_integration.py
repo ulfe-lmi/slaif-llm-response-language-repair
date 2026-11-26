@@ -36,6 +36,7 @@ on the 040 runtime with the same test bytes.
 from __future__ import annotations
 
 import contextlib
+import shutil
 import json
 import os
 import socket
@@ -2341,6 +2342,17 @@ class MainEntrypointConfigTests(_ScaledHarnessCase):
         call probes the proxy port (finite) until it actually accepts,
         proving the listener was bound, and returns the still-running
         owned process for the caller to stop."""
+        # The subprocess must HONOR the explicitly qualified
+        # CONCEPT_PANDOC (the application baseline installs the
+        # pinned Pandoc under RUNNER_TEMP and exports it; /usr/bin
+        # may be absent or the wrong version).  Resolution mirrors
+        # _real_spec exactly: the ambient qualified value wins, then
+        # PATH, then the historical location.
+        pandoc = (
+            os.environ.get("CONCEPT_PANDOC", "").strip()
+            or shutil.which("pandoc")
+            or "/usr/bin/pandoc"
+        )
         env = dict(os.environ)
         port = _free_port()
         env.update(
@@ -2348,7 +2360,7 @@ class MainEntrypointConfigTests(_ScaledHarnessCase):
                 "CONCEPT_UPSTREAM_URL": f"http://127.0.0.1:{self.main_server.port}",
                 "CONCEPT_REVIEWER_URL": f"http://127.0.0.1:{self.review_server.port}/v1",
                 "CONCEPT_INDEX": str(self.db),
-                "CONCEPT_PANDOC": "/usr/bin/pandoc",
+                "CONCEPT_PANDOC": pandoc,
                 "CONCEPT_HOST": "127.0.0.1",
                 "CONCEPT_PORT": str(port),
                 "CONCEPT_PASSTHROUGH": "0",
