@@ -15,6 +15,7 @@ model, corpus, network or quality claim (order 024-a, requirement 7).
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import itertools
 import json
@@ -48,6 +49,7 @@ from evidence_budget import (  # noqa: E402
     make_progress_handler,
     validate_default_evidence_policy,
 )
+from review_policy import DEFAULT_POLICY  # noqa: E402
 from runtime_acceptance import accept as _real_accept  # noqa: E402
 from runtime_corpus import (  # noqa: E402
     REASON_BUDGET_EXCEEDED,
@@ -801,7 +803,22 @@ class EngineEarlyLateTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.db = _evidence_db(self.root)
         self.reviewer = _StubReviewer()
-        self.engine = proxy.RepairEngine(self.db, self.reviewer, pandoc=_real_spec())
+        # Order 040-a axis separation (paired with the 025-a note
+        # below): the default characters_per_call=1024 would permit
+        # B=ceil(52423/1024)=52 review batches for this class's
+        # unchanged >52k codepoint payloads, so the class scopes one
+        # explicit TEST-ONLY policy with characters_per_call=100000
+        # (targets_per_call=4 and every other default unchanged) to
+        # keep the exact four-target one-call evidence-boundary shape
+        # under test.  Not a default-policy scalability run; every
+        # other assertion, payload, query and failure expectation is
+        # unchanged.
+        self.policy = dataclasses.replace(
+            DEFAULT_POLICY, characters_per_call=100_000
+        )
+        self.engine = proxy.RepairEngine(
+            self.db, self.reviewer, pandoc=_real_spec(), policy=self.policy
+        )
         # Order 025-a, requirement 6: this class's unchanged >52k
         # codepoint synthetic payloads exceed the default finite
         # analysis-eligibility limits, so the class scopes valid
@@ -921,7 +938,7 @@ class EngineEarlyLateTests(unittest.TestCase):
         # zero, with the same actual accept-then-abort lifecycle.
         self.reviewer = _StubReviewer(usage=False)
         self.engine = proxy.RepairEngine(
-            self.db, self.reviewer, pandoc=_real_spec()
+            self.db, self.reviewer, pandoc=_real_spec(), policy=self.policy
         )
         captured = self._track_corpora()
         events, tracked = _tracked_accept_events(_real_accept)
@@ -1017,7 +1034,21 @@ class ProxyRoundTripTests(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        self.harness = _Harness(usage_observer=self._observe)
+        # Order 040-a axis separation (paired with the 025-a note
+        # below): the default characters_per_call=1024 would permit
+        # B=ceil(52423/1024)=52 review batches for this class's
+        # unchanged >52k codepoint payloads, so the class scopes one
+        # explicit TEST-ONLY policy with characters_per_call=100000
+        # (targets_per_call=4 and every other default unchanged), the
+        # SAME instance for the harness engine and its paired real
+        # reviewer, to keep the exact four-target one-call
+        # evidence-boundary shape under test.  Not a default-policy
+        # scalability run; every other assertion, payload and failure
+        # expectation is unchanged.
+        self.policy = dataclasses.replace(
+            DEFAULT_POLICY, characters_per_call=100_000
+        )
+        self.harness = _Harness(usage_observer=self._observe, policy=self.policy)
         self.records: list[dict[str, object]] = []
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
