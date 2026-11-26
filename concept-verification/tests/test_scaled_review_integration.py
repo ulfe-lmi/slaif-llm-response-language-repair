@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import socket
 import sys
 import tempfile
@@ -57,6 +58,7 @@ from tests.test_review_batch import (  # noqa: E402
     _contract_body,
     _real_spec,
 )
+import request_lifecycle  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Fixtures (synthetic; every detector-suspected word is corpus-unknown,
@@ -68,6 +70,7 @@ _SHORT = "To je presenetliv zapisano, to je presenetliv zapisano."
 # No eligible suspicion on any epoch: clean baseline control.
 _CLEAN = "To je tako zapisano, to je tako zapisano."
 _FILLER_UNIT = "tako je tako zapisano"
+_FINE_TILE = "tako"
 _REPLACEMENT = "tako"
 _TARGET = "presenetliv"
 # Default batch context window (order 040-a keeps 240 as the default
@@ -105,6 +108,58 @@ def _long_answer(occurrences: int = 6) -> str:
 
 def _expected_repaired(answer: str) -> str:
     return answer.replace(_TARGET, _REPLACEMENT)
+
+
+def _padded_answer(occurrences: int, target_len: int) -> str:
+    """Deterministic answer with exactly ``occurrences`` eligible
+    occurrences and EXACTLY ``target_len`` original Unicode code
+    points.
+
+    The padding is an exact tiling (no loop): the gap between the
+    joined target sentences and ``target_len`` must decompose into
+    whole ``" " + _FILLER_UNIT`` steps (22 code points) plus a bounded
+    number of whole ``" tako"`` fine-tile steps (5 code points).  The
+    construction verifies the exact length invariant itself, so every
+    length assertion matches the construction by definition."""
+    unit = "To je presenetliv zapisano."
+    text = " ".join([unit] * occurrences)
+    gap = target_len - len(text)
+    step = 1 + len(_FILLER_UNIT)
+    fine = 1 + len(_FINE_TILE)
+    if gap <= 0:
+        raise AssertionError("padding target is below the base length")
+    tiles = None
+    for b in range(0, step):
+        rem = gap - fine * b
+        if rem >= 0 and rem % step == 0:
+            tiles = (rem // step, b)
+            break
+    if tiles is None:
+        raise AssertionError("fixture cannot reach the exact length")
+    a, b = tiles
+    text += (" " + _FILLER_UNIT) * a + (" " + _FINE_TILE) * b
+    assert len(text) == target_len
+    assert text.count(_TARGET) == occurrences
+    return text
+
+
+def _repaired_first_n(answer: str, n: int) -> str:
+    """Expected text when exactly the first ``n`` eligible
+    occurrences (original order; the detector ranks all occurrences
+    of the fixture identically, so ties break by original position)
+    are replaced and the rest stay untouched."""
+    out = []
+    last = 0
+    start = answer.find(_TARGET)
+    count = 0
+    while start != -1 and count < n:
+        out.append(answer[last:start])
+        out.append(_REPLACEMENT)
+        last = start + len(_TARGET)
+        count += 1
+        start = answer.find(_TARGET, last)
+    out.append(answer[last:])
+    return "".join(out)
 
 
 def _target_spans(answer: str) -> list[tuple[int, int]]:
@@ -264,23 +319,40 @@ def _hold_until_close(sock: socket.socket, release: threading.Event) -> bool:
     return False
 
 
+class _MainState:
+    """Per-exchange state of the synthetic main upstream: the
+    completed JSON payload and the request/closed events are swapped
+    per exchange so one owned proxy can serve several exchanges.
+    ``hold_before_headers`` keeps the connection accepted and the
+    request fully read but sends no response byte (main held before
+    headers)."""
+
+    def __init__(self, payload: bytes, hold_before_headers: bool = False) -> None:
+        self.payload = payload
+        self.hold_before_headers = hold_before_headers
+        self.released = threading.Event()
+        self.request_event = threading.Event()
+        self.closed = threading.Event()
+
+
 def _main_complete_handler(
-    requests: list[dict[str, object]],
-    payload: bytes,
-    released: threading.Event,
-    request_event: threading.Event,
-    closed: threading.Event,
+    requests: list[dict[str, object]], state: _MainState
 ) -> Callable[[socket.socket], None]:
-    """Synthetic main upstream: one completed JSON response, then hold
-    until the proxy closes the request-scoped connection."""
+    """Synthetic main upstream: one completed JSON response per
+    exchange, then hold until the proxy closes the request-scoped
+    connection."""
 
     def handle(client: socket.socket) -> None:
         line, headers, body = _read_http_request(client)
         requests.append({"line": line, "headers": headers, "body": body})
-        request_event.set()
-        _send_http_response(client, payload, "application/json")
-        if _hold_until_close(client, released):
-            closed.set()
+        state.request_event.set()
+        if state.hold_before_headers:
+            if _hold_until_close(client, state.released):
+                state.closed.set()
+            return
+        _send_http_response(client, state.payload, "application/json")
+        if _hold_until_close(client, state.released):
+            state.closed.set()
 
     return handle
 
@@ -307,6 +379,13 @@ class _DynamicReviewer:
         self.usage: list[dict[str, int] | None] = []
         self.replacement: str = _REPLACEMENT
         self.released = threading.Event()
+        # Per-call raw payload overrides for the failure matrix:
+        # call i (1-based) sends faults[i-1] verbatim when set.
+        self.fault_payloads: list[bytes | None] = []
+        # Call i (1-based) whose connection is held without any
+        # response: the real owned exchange must be bounded by its
+        # own deadline or the request's cancellation.
+        self.hold_from_call: int | None = None
 
     def handler(self) -> Callable[[socket.socket], None]:
         def handle(client: socket.socket) -> None:
@@ -317,8 +396,28 @@ class _DynamicReviewer:
             )
             index = len(self.requests)
             self.call_events.append(event)
-            usage = self.usage[index - 1] if index - 1 < len(self.usage) else None
-            payload = self._payload_for(json.loads(body.decode("utf-8")), usage)
+            if (
+                self.hold_from_call is not None
+                and index == self.hold_from_call
+            ):
+                # Arrived and held: never answer this call.
+                event.set()
+                _hold_until_close(client, self.released)
+                return
+            fault = (
+                self.fault_payloads[index - 1]
+                if index - 1 < len(self.fault_payloads)
+                else None
+            )
+            if fault is not None:
+                payload = fault
+            else:
+                usage = (
+                    self.usage[index - 1]
+                    if index - 1 < len(self.usage)
+                    else None
+                )
+                payload = self._payload_for(json.loads(body.decode("utf-8")), usage)
             event.set()
             _send_http_response(client, payload, "application/json")
             _hold_until_close(client, self.released)
@@ -382,6 +481,15 @@ class _DynamicReviewer:
             raise AssertionError("batch-v1 payload carries no target list")
         return [dict(item) for item in targets]
 
+    def begin_exchange(self) -> None:
+        """Reset the per-exchange wire state of this endpoint (the
+        server itself stays owned across exchanges of one proxy)."""
+        self.requests = []
+        self.call_events = []
+        self.fault_payloads = []
+        self.hold_from_call = None
+        self.usage = []
+
     def wait_calls(self, count: int, limit: float = 15.0) -> bool:
         """Finite event wait for ``count`` actually-arrived calls."""
         deadline = time.monotonic() + limit
@@ -424,6 +532,9 @@ class _Harness:
         observed: threading.Event,
         *,
         review_usage: list[dict[str, int] | None] | None = None,
+        review_timeout: float = 8.0,
+        reviewer_override: object | None = None,
+        hold_main_before_headers: bool = False,
     ) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.db = _build_corpus(Path(self.temp.name))
@@ -431,29 +542,25 @@ class _Harness:
         self.reviewer = _DynamicReviewer()
         self.reviewer.usage = review_usage or []
         self.main_requests: list[dict[str, object]] = []
-        self.main_released = threading.Event()
-        self.main_event = threading.Event()
-        self.main_closed = threading.Event()
+        self.main_state = _MainState(self.source, hold_main_before_headers)
         self.main_server = _LoopbackServer(
             "main-upstream",
-            _main_complete_handler(
-                self.main_requests,
-                self.source,
-                self.main_released,
-                self.main_event,
-                self.main_closed,
-            ),
+            _main_complete_handler(self.main_requests, self.main_state),
         )
         self.review_server = _LoopbackServer(
             "review-upstream", self.reviewer.handler()
         )
         self.main_server.start()
         self.review_server.start()
-        reviewer = ResponsesReviewer(
-            f"http://127.0.0.1:{self.review_server.port}/v1",
-            "test-model",
-            timeout=8.0,
-            api_key="fake-key",
+        reviewer = (
+            reviewer_override
+            if reviewer_override is not None
+            else ResponsesReviewer(
+                f"http://127.0.0.1:{self.review_server.port}/v1",
+                "test-model",
+                timeout=review_timeout,
+                api_key="fake-key",
+            )
         )
         engine = proxy.RepairEngine(self.db, reviewer, pandoc=_real_spec())
         self.proxy_server = proxy.ConceptProxy(
@@ -469,6 +576,24 @@ class _Harness:
         thread.start()
         self.threads.append(thread)
 
+    @property
+    def main_event(self) -> threading.Event:
+        return self.main_state.request_event
+
+    @property
+    def main_closed(self) -> threading.Event:
+        return self.main_state.closed
+
+    def set_answer(self, answer: str) -> None:
+        """Point the next exchange of this owned proxy at a new
+        completed answer (fresh per-exchange events and fake state)."""
+        self.source = _json_completed(answer)
+        self.main_state = _MainState(self.source)
+        self.main_server._handler = _main_complete_handler(
+            self.main_requests, self.main_state
+        )
+        self.reviewer.begin_exchange()
+
     def exchange(self) -> tuple[int, dict[str, str], bytes]:
         """One client POST of the nonstreaming contract body; returns
         the proxy response triple."""
@@ -482,7 +607,7 @@ class _Harness:
             client.close()
 
     def close(self) -> None:
-        self.main_released.set()
+        self.main_state.released.set()
         self.reviewer.released.set()
         with contextlib.suppress(Exception):
             self.proxy_server.shutdown()
@@ -645,6 +770,552 @@ class ScaledReviewFirstCheckpointTests(_ScaledHarnessCase):
         # connection quietly.
         self.assertTrue(harness.main_closed.wait(10.0))
 
+
+
+# ---------------------------------------------------------------------------
+# Expanded ordered matrix (order 040-a, requirement 8).
+# ---------------------------------------------------------------------------
+_BOUNDARY_LENGTHS = (1023, 1024, 1025, 2048, 2049)
+_BOUNDARY_OCCURRENCES = 5
+# Failure-matrix fixture: nine eligible sites at exactly 2049 code
+# points (one past the second 1024 unit: B = 3, three batches 4+4+1).
+_FAILURE_OCCURRENCES = 9
+_FAILURE_LENGTH = 2049
+
+
+class CallBudgetBoundaryTests(_ScaledHarnessCase):
+    """Default call-budget boundary: B = ceil(N/1024) with five
+    eligible occurrences at N = 1023/1024/1025/2048/2049 code points.
+
+    N <= 1024 keeps B = 1 (at most 4 targets: the first four in
+    original order are reviewed in one call, the fifth is untouched) -
+    this old- and new-runtime-identical behavior is the boundary
+    control.  N >= 1025 raises the allowance to at least 8 targets,
+    so all five sites are reviewed in two sequential calls (4+1) and
+    every site is repaired.  On the old runtime the N >= 1025 cases
+    are EXPECTED TO FAIL at the actual missing scaled behavior (four
+    of five sites reviewed in one call, one site left unreviewed).
+    """
+
+    def test_call_budget_boundaries_at_default_characters_per_call(self) -> None:
+        for n in _BOUNDARY_LENGTHS:
+            with self.subTest(length=n):
+                answer = _padded_answer(_BOUNDARY_OCCURRENCES, n)
+                self.assertEqual(len(answer), n)
+                self.assertEqual(len(_target_spans(answer)), _BOUNDARY_OCCURRENCES)
+                budget = (n + 1023) // 1024  # ceil(n/1024)
+                selected = min(_BOUNDARY_OCCURRENCES, budget * 4)
+                expected_calls = (selected + 3) // 4
+                expected_text = (
+                    _expected_repaired(answer)
+                    if selected == _BOUNDARY_OCCURRENCES
+                    else _repaired_first_n(answer, selected)
+                )
+                harness = _Harness(answer, self.records, self.observed)
+                self.harness = harness
+                try:
+                    status, _headers, body = harness.exchange()
+                    self.assertEqual(status, 200)
+                    self.assertEqual(
+                        self._answer_text(body),
+                        expected_text,
+                        "scaled selection/repair mismatch",
+                    )
+                    self.assertTrue(harness.reviewer.wait_calls(expected_calls))
+                    self.assertEqual(
+                        len(harness.reviewer.requests),
+                        expected_calls,
+                        "actual dispatch count must equal the bounded batches",
+                    )
+                    # Every dispatched batch stays within the four
+                    # targets-per-call default.
+                    for record in harness.reviewer.requests:
+                        request_body = json.loads(record["body"].decode("utf-8"))
+                        self.assertLessEqual(
+                            len(harness.reviewer.parse_targets(request_body)), 4
+                        )
+                finally:
+                    harness.close()
+        self.harness = None
+
+
+def _incomplete_envelope() -> bytes:
+    """A structurally present but incomplete batch envelope: the
+    assistant message inside a completed envelope carries the
+    contradictory in-progress marker (fixed rejection label)."""
+    return (
+        b'{"object":"response","status":"completed","output":['
+        b'{"type":"message","role":"assistant","status":"in_progress",'
+        b'"content":[{"type":"output_text","text":""}]}]}'
+    )
+
+
+class BatchFailureMatrixTests(_ScaledHarnessCase):
+    """Any second-batch transport/structural/incomplete failure must
+    STOP later batches, discard uncommitted proposals and return the
+    completed original answer TEXT (byte-identical here), with the
+    actual attempted-call count and unknown usage recorded - never a
+    partial repair, never a zeroed attempt, never a later call.  The
+    fixture carries nine eligible sites (B = 3, batches 4+4+1) so the
+    suppressed third batch genuinely EXISTS after the failed second
+    batch.  On the old runtime these cases are EXPECTED TO FAIL at the
+    actual missing multi-batch behavior: the second call never exists,
+    so the fault never triggers and a four-of-nine partial repair is
+    delivered instead of the completed original.
+    """
+
+    def _run_failure_case(
+        self,
+        *,
+        review_timeout: float = 8.0,
+        fault: bytes | None = None,
+        hold_second: bool = False,
+    ) -> None:
+        # Nine eligible sites with 2048 < N <= 3072 code points: the
+        # default allowance is B = 3 (up to 12 targets), so all nine
+        # sites are selected into three batches (4+4+1).  A second-
+        # batch failure therefore has a GENUINELY AVAILABLE third
+        # batch that the runtime must suppress - six sites/B=2 could
+        # not prove later-call suppression.
+        answer = _padded_answer(_FAILURE_OCCURRENCES, _FAILURE_LENGTH)
+        harness = _Harness(
+            answer,
+            self.records,
+            self.observed,
+            review_timeout=review_timeout,
+        )
+        self.harness = harness
+        if fault is not None:
+            harness.reviewer.fault_payloads = [None, fault]
+        if hold_second:
+            # The second call's connection is never answered: the
+            # real owned exchange must be bounded by its own
+            # configured absolute whole-exchange deadline.
+            harness.reviewer.hold_from_call = 2
+        status, _headers, body = harness.exchange()
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body,
+            harness.source,
+            "batch failure must deliver the completed original text",
+        )
+        self.assertTrue(harness.reviewer.wait_calls(2))
+        # No later batch after the failed one: exactly two actual
+        # dispatches (the failed second counts as attempted) and the
+        # available third batch was never sent.
+        self.assertEqual(len(harness.reviewer.requests), 2)
+        self.assertEqual(
+            self.records,
+            [{"review_calls": 2, "reviewer_usage": "unknown"}],
+        )
+
+    def test_second_batch_invalid_json_returns_original_no_later_calls(self) -> None:
+        self._run_failure_case(fault=b"{not json at all")
+
+    def test_second_batch_incomplete_envelope_returns_original_no_later_calls(
+        self,
+    ) -> None:
+        self._run_failure_case(fault=_incomplete_envelope())
+
+    def test_second_batch_timeout_returns_original_no_later_calls(self) -> None:
+        # Short configured whole-exchange deadline for this exchange:
+        # the held second call fails at its own bounded deadline.
+        self._run_failure_case(hold_second=True, review_timeout=2.0)
+
+
+class UsageAggregationTests(_ScaledHarnessCase):
+    """Actual reviewer usage across all attempted calls: aggregated
+    ONLY when every attempted result supplies validated usage,
+    unknown (never partial-as-total, never zero, sticky across the
+    attempted set) otherwise.  Missing or invalid usage is
+    bookkeeping ONLY: it must not reject the structurally valid
+    proposals of that batch or suppress the CPU-accepted repair
+    (existing batch parser contract, order 040-a R6/R7) - the
+    completed repaired answer is still delivered.  Fresh requests
+    start with cleared request-local state.  On the old runtime the
+    two-batch cases are EXPECTED TO FAIL at the actual missing scaled
+    behavior (one attempted call, one result's usage).
+    """
+
+    _U1 = {"input_tokens": 11, "output_tokens": 17, "total_tokens": 28}
+    _U2 = {"input_tokens": 13, "output_tokens": 19, "total_tokens": 32}
+
+    def _summed(self) -> dict[str, int]:
+        return {
+            "input_tokens": self._U1["input_tokens"] + self._U2["input_tokens"],
+            "output_tokens": self._U1["output_tokens"] + self._U2["output_tokens"],
+            "total_tokens": self._U1["total_tokens"] + self._U2["total_tokens"],
+        }
+
+    def test_two_batches_aggregate_known_usage(self) -> None:
+        answer = _long_answer()
+        harness = _Harness(
+            answer,
+            self.records,
+            self.observed,
+            review_usage=[dict(self._U1), dict(self._U2)],
+        )
+        self.harness = harness
+        status, _headers, body = harness.exchange()
+        self.assertEqual(status, 200)
+        self.assertEqual(self._answer_text(body), _expected_repaired(answer))
+        self.assertTrue(harness.reviewer.wait_calls(2))
+        self.assertEqual(len(harness.reviewer.requests), 2)
+        self.assertEqual(
+            self.records,
+            [{"review_calls": 2, "reviewer_usage": self._summed()}],
+        )
+
+    def test_second_batch_missing_usage_is_unknown_never_partial(self) -> None:
+        # The second batch's envelope omits usage: bookkeeping only.
+        # Its valid proposals are still CPU-accepted and ALL six
+        # edits are composed - the missing usage may only make the
+        # aggregate unknown, never the answer original or partial.
+        answer = _long_answer()
+        harness = _Harness(
+            answer,
+            self.records,
+            self.observed,
+            review_usage=[dict(self._U1), None],
+        )
+        self.harness = harness
+        status, _headers, body = harness.exchange()
+        self.assertEqual(status, 200)
+        self.assertEqual(self._answer_text(body), _expected_repaired(answer))
+        self.assertTrue(harness.reviewer.wait_calls(2))
+        self.assertEqual(len(harness.reviewer.requests), 2)
+        self.assertEqual(
+            self.records,
+            [{"review_calls": 2, "reviewer_usage": "unknown"}],
+        )
+
+    def test_first_batch_missing_usage_is_sticky_unknown(self) -> None:
+        # The first batch's envelope omits usage and the second
+        # supplies validated usage: the aggregate over the attempted
+        # set is still unknown - never the known second batch's
+        # usage as a partial-as-total - while the repair is complete.
+        answer = _long_answer()
+        harness = _Harness(
+            answer,
+            self.records,
+            self.observed,
+            review_usage=[None, dict(self._U2)],
+        )
+        self.harness = harness
+        status, _headers, body = harness.exchange()
+        self.assertEqual(status, 200)
+        self.assertEqual(self._answer_text(body), _expected_repaired(answer))
+        self.assertTrue(harness.reviewer.wait_calls(2))
+        self.assertEqual(len(harness.reviewer.requests), 2)
+        self.assertEqual(
+            self.records,
+            [{"review_calls": 2, "reviewer_usage": "unknown"}],
+        )
+
+    def test_fresh_request_resets_request_local_state(self) -> None:
+        answer = _long_answer()
+        # Request A: six occurrences, two batches, known usage.
+        harness = _Harness(
+            answer,
+            self.records,
+            self.observed,
+            review_usage=[dict(self._U1), dict(self._U2)],
+        )
+        self.harness = harness
+        status, _headers, body = harness.exchange()
+        self.assertEqual(status, 200)
+        self.assertEqual(self._answer_text(body), _expected_repaired(answer))
+        self.assertEqual(
+            self.records,
+            [{"review_calls": 2, "reviewer_usage": self._summed()}],
+        )
+        # Request B on the SAME owned proxy: clean answer; no earlier
+        # request's calls or usage may leak into its record.
+        harness.set_answer(_CLEAN)
+        status, _headers, body = harness.exchange()
+        self.assertEqual(status, 200)
+        self.assertEqual(body, harness.source)
+        self.assertEqual(len(harness.reviewer.requests), 0)
+        self.assertEqual(
+            self.records,
+            [
+                {"review_calls": 2, "reviewer_usage": self._summed()},
+                {"review_calls": 0, "reviewer_usage": "unknown"},
+            ],
+        )
+
+
+
+
+# ---------------------------------------------------------------------------
+# Cancellation matrix (order 040-a, requirement 6 and 8): before /
+# between / during calls with exact attempted-call counts,
+# known-unknown usage, owned-child cleanup and no leak into the next
+# request.  Real TCP FIN disconnects drive the real request-owned
+# cancellation scope; only the narrow timing coordination below is a
+# test-owned barrier - it observes real state and never substitutes
+# for the product behavior.
+# ---------------------------------------------------------------------------
+import request_lifecycle  # noqa: E402
+
+
+def _owned_child_pids() -> set[int]:
+    """The pids of the live/zombie children of THIS test process."""
+    my_pid = os.getpid()
+    pids: set[int] = set()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            stat = Path(f"/proc/{entry}/stat").read_text()
+        except OSError:
+            continue
+        fields = stat.rsplit(")", 1)[1].split()
+        if int(fields[1]) == my_pid:
+            pids.add(int(entry))
+    return pids
+
+
+def _wait_no_children(limit: float = 10.0) -> set[int]:
+    """Bounded wait for the owned review-exchange child to be
+    terminated and reaped after an abort."""
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        pids = _owned_child_pids()
+        if not pids:
+            return set()
+        time.sleep(0.02)
+    return _owned_child_pids()
+
+
+class _BarrierSpy:
+    """Narrow timing proof, labeled separately from full HTTP
+    integration: a transparent forwarding spy over the REAL
+    ResponsesReviewer.review_batch.  It never replaces the behavior
+    or the result of a call; it only coordinates the test around the
+    real first-call completion and the real request scope's observed
+    cancellation state.
+    """
+
+    def __init__(self, real: ResponsesReviewer) -> None:
+        self._real = real
+        self.calls = 0
+        self.first_completed = threading.Event()
+        self.halt_after_first: bool = False
+
+    def review_batch(self, sentence: str, targets: object) -> object:
+        self.calls += 1
+        result = self._real.review_batch(sentence, targets)
+        if self.halt_after_first and self.calls == 1:
+            # Return the REAL first-call result only after the REAL
+            # request scope carries the observed cancellation, so the
+            # engine can never dispatch the next batch before the
+            # dedicated cancellation is visible at its boundary.
+            self.first_completed.set()
+            scope = request_lifecycle.active_scope()
+            deadline = time.monotonic() + 20.0
+            while scope is None or not scope.cancelled():
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        "real scope never cancelled during the barrier"
+                    )
+                time.sleep(0.01)
+        return result
+
+
+class CancellationMatrixTests(_ScaledHarnessCase):
+    """User cancellation halts later dispatch, kills/reaps the owned
+    exchange child, emits exactly one content-free abort observation
+    with the actual attempted-call count and validated
+    known-or-unknown usage, and leaves no request-local state for the
+    next request.  On the old runtime the during-second-call case is
+    EXPECTED TO FAIL at the actual missing multi-batch behavior (no
+    second dispatch ever happens, so the gate never becomes ready);
+    the before/any-call and between-calls cases document the single-
+    call invariants the old runtime already satisfies.
+    """
+
+    def _fin_exchange(self, harness: _Harness, ready: Callable[[], bool]) -> dict:
+        """One exchange whose client performs a real write-half close
+        (FIN) once ``ready`` holds.
+
+        ONE authoritative reader thread owns the client socket after
+        the POST: it captures EVERY byte the proxy sends on the
+        connection until the proxy-side close (EOF).  The test never
+        reads the socket itself, so no spurious response byte can be
+        consumed before the quiet-abort assertion.  The result dict
+        carries the captured stream (must be empty), the observed EOF
+        (must be True: the proxy actually closed) and any reader
+        error.  On every exit path the socket is closed BEFORE the
+        final join so a residual reader cannot strand the thread.
+        """
+        client = socket.create_connection(
+            ("127.0.0.1", harness.proxy_server.server_port), timeout=20
+        )
+        captured: list[bytes] = []
+        state: dict = {"eof": False, "error": None, "reader_done": threading.Event()}
+
+        def job() -> None:
+            try:
+                _post_to_proxy(client, _contract_body(False))
+                # Single authoritative reader: every byte until the
+                # proxy-side close; a bounded cap only prevents an
+                # unbounded capture - any byte at all fails the test.
+                while True:
+                    chunk = client.recv(65536)
+                    if not chunk:
+                        state["eof"] = True
+                        break
+                    captured.append(chunk)
+                    if len(captured) >= 4:
+                        break
+            except OSError as exc:
+                state["error"] = exc
+            finally:
+                state["reader_done"].set()
+
+        thread = threading.Thread(target=job, daemon=False)
+        thread.start()
+        joined = False
+        try:
+            deadline = time.monotonic() + 20.0
+            while not ready():
+                if time.monotonic() >= deadline:
+                    raise AssertionError("FIN gate never became ready")
+                time.sleep(0.01)
+            client.shutdown(socket.SHUT_WR)
+            self.assertTrue(self.observed.wait(20.0), "no abort observation")
+            self.assertTrue(
+                state["reader_done"].wait(20.0),
+                "single authoritative reader did not finish",
+            )
+        finally:
+            # Close before the final join on EVERY path (including
+            # gate/assertion failures): unblocks any residual reader,
+            # then actually joins the owned client thread.
+            with contextlib.suppress(OSError):
+                client.close()
+            thread.join(15.0)
+            joined = not thread.is_alive()
+        self.assertTrue(joined, "client reader thread not joined")
+        return {
+            "bytes": b"".join(captured),
+            "eof": state["eof"],
+            "error": state["error"],
+        }
+
+    def test_cancellation_before_any_call_zero_calls_unknown_usage(self) -> None:
+        answer = _long_answer()
+        harness = _Harness(
+            answer,
+            self.records,
+            self.observed,
+            hold_main_before_headers=True,
+        )
+        self.harness = harness
+        result = self._fin_exchange(harness, harness.main_event.is_set)
+        # Pre-dispatch cancellation: zero attempted calls, explicit
+        # unknown usage, no reviewer traffic, quiet close (no byte on
+        # the closed client, and the proxy actually closed it).
+        self.assertEqual(len(harness.reviewer.requests), 0)
+        self.assertEqual(
+            self.records, [{"review_calls": 0, "reviewer_usage": "unknown"}]
+        )
+        self.assertEqual(result["bytes"], b"")
+        self.assertIs(result["eof"], True)
+
+    def test_cancellation_between_calls_halts_later_dispatch(self) -> None:
+        answer = _long_answer()
+        harness = _Harness(
+            answer,
+            self.records,
+            self.observed,
+            review_usage=[dict(UsageAggregationTests._U1), dict(UsageAggregationTests._U2)],
+        )
+        self.harness = harness
+        real_reviewer = ResponsesReviewer(
+            f"http://127.0.0.1:{harness.review_server.port}/v1",
+            "test-model",
+            timeout=8.0,
+            api_key="fake-key",
+        )
+        spy = _BarrierSpy(real_reviewer)
+        spy.halt_after_first = True
+        # Swap the harness engine's reviewer for the spy over the
+        # REAL reviewer BEFORE the exchange: the spy forwards every
+        # call to the real one (same transport target, same owned
+        # exchange) and only coordinates the barrier around the real
+        # first-call result and the real scope state.
+        harness.proxy_server.engine.reviewer = spy
+        self._fin_exchange(harness, spy.first_completed.is_set)
+        # Exactly one actual dispatch: the later batch was halted.
+        self.assertEqual(len(harness.reviewer.requests), 1)
+        self.assertEqual(spy.calls, 1)
+        # One attempted call with validated usage: aggregate is that
+        # call's known usage, never unknown and never zero.
+        self.assertEqual(
+            self.records,
+            [
+                {
+                    "review_calls": 1,
+                    "reviewer_usage": dict(UsageAggregationTests._U1),
+                }
+            ],
+        )
+        self.assertEqual(_wait_no_children(), set())
+
+    def test_cancellation_during_second_call_counts_two_unknown_usage_no_leak(
+        self,
+    ) -> None:
+        answer = _long_answer()
+        harness = _Harness(
+            answer,
+            self.records,
+            self.observed,
+            review_usage=[dict(UsageAggregationTests._U1), dict(UsageAggregationTests._U2)],
+        )
+        self.harness = harness
+        # The second call's connection is never answered: the real
+        # owned exchange is in flight when the client FINs.
+        harness.reviewer.hold_from_call = 2
+
+        def ready() -> bool:
+            return (
+                len(harness.reviewer.call_events) >= 2
+                and harness.reviewer.call_events[1].is_set()
+            )
+
+        result = self._fin_exchange(harness, ready)
+        # Quiet abort: no spurious byte on the closed client, and the
+        # proxy actually closed the connection.
+        self.assertEqual(result["bytes"], b"")
+        self.assertIs(result["eof"], True)
+        # Both calls actually attempted at the owned dispatch
+        # boundary; the failed second call makes the aggregate
+        # unknown (the first call's known usage is never
+        # partial-as-total).
+        self.assertEqual(len(harness.reviewer.requests), 2)
+        self.assertEqual(
+            self.records,
+            [{"review_calls": 2, "reviewer_usage": "unknown"}],
+        )
+        # The owned exchange child was terminated and reaped.
+        self.assertEqual(_wait_no_children(), set())
+        # No request-local state leaks into the NEXT request on the
+        # same owned proxy: a clean answer observes zero calls and
+        # explicit unknown usage.
+        harness.set_answer(_CLEAN)
+        status, _headers, body = harness.exchange()
+        self.assertEqual(status, 200)
+        self.assertEqual(body, harness.source)
+        self.assertEqual(len(harness.reviewer.requests), 0)
+        self.assertEqual(
+            self.records,
+            [
+                {"review_calls": 2, "reviewer_usage": "unknown"},
+                {"review_calls": 0, "reviewer_usage": "unknown"},
+            ],
+        )
 
 if __name__ == "__main__":
     unittest.main()
