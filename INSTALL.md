@@ -357,6 +357,7 @@ X-LLM-Language-Repair-Details: 1
 
 The header is a private control: the proxy consumes it, never forwards it to
 the upstream or to the reviewer on any route, and it is not a startup setting.
+
 A runnable plain-terminal client that displays the delivered answer, the
 original answer when returned, and the fixed missing-original message is
 documented in [examples/README.md](examples/README.md).

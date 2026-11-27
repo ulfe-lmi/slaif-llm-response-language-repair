@@ -1,28 +1,30 @@
 # Example: plain-terminal comparison client
 
-`repair_chat.py` is a runnable, deliberately simple example of a non-agent
-Responses client for this proxy. It loads a Codex-style TOML configuration and
-model catalog, runs a text-only chat loop, and shows — in ordinary terminal
-scrollback — the server-provided thinking (when the server sends any), the
-authoritative delivered answer, and the original answer when the language-repair
-extension is actually returned.
-
-It is a comparison example, not a product component and not a full Codex
-client. It never starts an AI process, reads `auth.json` or performs OAuth,
-retries requests, keeps any on-disk transcript, or manipulates the terminal
-screen: output is plain append-only lines with a prompt (no ANSI cursor
-movement, alternate screen, clearing or spinners), and it supports the
-Responses wire API only.
-
-## Run it
-
-Python 3.12 standard library only — no new SDK or package is required:
+`repair_chat.py` is a runnable plain-terminal client for this proxy: it
+compares the **delivered answer** with the **original answer** when the
+language-repair extension is actually returned, and displays the
+server-provided thinking while the request runs. It loads a Codex-style TOML
+configuration and model catalog (Python 3.12 standard library only — no new
+SDK or package is required):
 
 ```bash
-# against the local installed proxy (see INSTALL.md for the proxy setup)
-python3.12 examples/repair_chat.py --profile early-beta \
-  --model qwen3.8-27b-rtx3090-repaired --base-url http://127.0.0.1:18024/v1
+# the profile's configured gateway/proxy base URL is used as-is
+python3.12 examples/repair_chat.py --profile early-beta
 ```
+
+`--model qwen3.8-27b-rtx3090-repaired` selects the gateway routing alias (the
+`-repaired` suffix is a gateway alias, not an upstream model ID) through the
+profile's configured gateway. Use `--base-url` only when pointing directly at
+an upstream or an installed proxy: then supply that endpoint's actual model
+ID and its own credentials — a gateway alias combined with direct
+credentials is an invalid combination. See INSTALL.md for the direct proxy
+setup.
+
+The session is ordinary terminal scrollback with a prompt: plain numbered
+`/model` and `/thinking` menus (the selection is read from the next line),
+append-only lines with no ANSI cursor movement, alternate screen, clearing or
+spinners. It changes the reasoning of the **main** requests only — the
+proxy's reviewer and its settings are untouched.
 
 Useful options (`--help` lists all of them):
 
@@ -34,7 +36,7 @@ Useful options (`--help` lists all of them):
 | `--models FILE` | explicit model catalog JSON |
 | `--model SLUG` | select the model |
 | `--thinking LEVEL` | initial reasoning effort for MAIN requests |
-| `--base-url URL` | override the API base (for example the local proxy) |
+| `--base-url URL` | override the API base (for example a local proxy) |
 | `--timeout SECONDS` | finite request timeout, default 900 |
 
 ## Configuration
@@ -54,40 +56,56 @@ is resolved, in order, as:
 3. when neither exists the client fails with a clear error; it never falls
    back silently to unrelated root model/provider settings.
 
-For each setting the precedence is: command line > selected profile > root
-defaults > the selected model's declared catalog default.
+For each setting, the command line overrides the selected settings; a table
+profile inherits the root defaults for everything it does not name; a
+standalone file's model/effort/catalog settings are complete and do not fall
+back to the root (root provider definitions are a lookup only); and the
+selected model's declared catalog default is a fallback for the reasoning
+**effort** only — it never supplies a missing model.
 `~` is expanded; a relative `model_catalog_json` is resolved against the
 selected config directory. `--models` overrides `model_catalog_json`. A
 `models.json` next to the config file is used only when neither an explicit
 path nor a catalog path names a file.
 
-Minimal synthetic configuration (never copy real credentials into examples):
+The complete synthetic standalone example below matches the command above
+(replace the gateway URL with the one you use; never copy real credentials
+into examples):
 
 ```toml
-# ~/.codex/config.toml
+# ~/.codex/early-beta.config.toml
 model = "qwen3.8-27b"
 model_provider = "slaif"
 model_reasoning_effort = "low"
-model_catalog_json = "models.json"
+model_catalog_json = "early-beta-models.json"
 
 [model_providers.slaif]
 name = "SLAIF gateway"
-base_url = "http://127.0.0.1:18024/v1"
+base_url = "https://gateway.example/v1"
 wire_api = "responses"
 env_key = "SYNTHETIC_API_KEY"
 ```
 
+`~/.codex/early-beta-models.json`:
+
 ```json
-// ~/.codex/models.json
 {
   "models": [
     {
       "slug": "qwen3.8-27b",
       "display_name": "Qwen 3.8 27B",
-      "default_reasoning_level": "low",
+      "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
-        {"effort": "minimal"}, {"effort": "low"},
-        {"effort": "medium"}, {"effort": "high"}
+        {"effort": "none"}, {"effort": "low"},
+        {"effort": "medium"}, {"effort": "xhigh"}
+      ]
+    },
+    {
+      "slug": "qwen3.8-27b-rtx3090-repaired",
+      "display_name": "Qwen 3.8 27B repaired",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {"effort": "none"}, {"effort": "low"},
+        {"effort": "medium"}, {"effort": "xhigh"}
       ]
     }
   ]
@@ -118,46 +136,56 @@ cancels; an invalid selection leaves the current choice unchanged):
 you> /model
 Models (enter a number or slug, 0 to cancel):
   1. qwen3.8-27b  (Qwen 3.8 27B) [current]
-  2. qwen3.8-27b-rtx3090-repaired
+  2. qwen3.8-27b-rtx3090-repaired  (Qwen 3.8 27B repaired)
 select> 2
 Next request will use model: qwen3.8-27b-rtx3090-repaired
 you> /thinking
 Thinking effort for qwen3.8-27b-rtx3090-repaired (enter a number or level, 0 to cancel):
-  1. minimal
+  1. none
   2. low [current]
   3. medium
-  4. high
+  4. xhigh
 select> 3
 Next request will use thinking effort: medium
 ```
 
-`/model SLUG|N` and `/thinking LEVEL` are direct conveniences; they do not
-replace the menu workflow. Switching models preserves the chosen effort when
-the new model supports it and otherwise resets it to the model's declared
-default with a clear message — never a silent unsupported effort. If no
-catalog is loaded, `/model` takes an explicit model ID and effort uses
-conventional values without an invented support claim. Menus and slash
-commands make zero API calls; the selection applies to the next request.
+The menus list exactly the entries of your catalog file (your own file may
+declare more choices). `/model SLUG|N` and `/thinking LEVEL` are direct
+conveniences; they do not replace the menu workflow. Switching models
+preserves the chosen effort when the new model supports it and otherwise
+resets it to the model's declared default with a clear message — never a
+silent unsupported effort. If no catalog is loaded, `/model` takes an
+explicit model ID and effort uses conventional values without an invented
+support claim. Menus and slash commands make zero API calls; the selection
+applies to the next request.
 
-A session with thinking, a repaired answer and the missing-original message
-looks like this:
+A session with thinking and a repaired answer (illustrative output, not a
+real model transcript):
 
 ```text
 repair chat client - /help for commands, /quit to exit
-you> Napiši en kratek stavek o sončnem dnevu.
+you> Napiši kratek stavek o sončnem dnevu.
 Thinking
-Sončen dan, topel zrak, modro nebo.
+Kratek stavek o sončnem dnevu.
 Delivered response
-Napišem kratek stavek o sončnem dnevu.
+Lep sončen dan 😀.
 Original response
-Napišem kratek stavek o sončnem dnevu.
-Applied edits: 1 edit(s), code-point ranges: 4-7 -> 4-7
+Lep sončn dan 😀.
+Applied edits: 1 edit(s), code-point ranges: 4-9 -> 4-10
 you> /quit
 ```
 
-(If the extension is absent, unavailable or invalid the last block is exactly
-`Original response was not provided.`, optionally followed by the fixed
-content-free reason; the delivered answer is still displayed and committed.)
+When no valid extension comes back (absent, unavailable or invalid metadata),
+the original block is exactly the fixed message, optionally followed by the
+fixed content-free reason; the delivered answer is still displayed and
+committed:
+
+```text
+you> Napiši kratek stavek o deževnem dnevu.
+Delivered response
+Dan je deževen.
+Original response was not provided.
+```
 
 ## What it sends, and honest limits
 
@@ -170,23 +198,29 @@ content-free reason; the delivered answer is still displayed and committed.)
   or session linkage, and no tools or catalog coding instructions).
 - `reasoning.effort` changes **main user requests only**. The proxy's
   reviewer, its low default and all proxy settings are untouched.
-- Thinking is displayed only when the server actually streams reasoning
-  events; a higher effort does not imply support, and the client never
-  fabricates thinking. Raw text and summary channels are kept distinct.
-- The original answer appears only when a deployed proxy with the repair
-  details enabled returns a valid `llm_language_repair` extension whose
-  headers survive any gateway in between; an unrepaired model, an off proxy,
-  or a filtered header simply means no extension and the fixed
-  missing-original message. The default (transparent) proxy accepts
+- Thinking is displayed only when the server actually provides reasoning —
+  streamed deltas or the completed JSON / item / done fallback content; a
+  higher effort does not imply support, and the client never fabricates
+  thinking. Raw text and summary channels are kept distinct.
+- The original answer appears only when a deployed proxy returns a valid
+  `llm_language_repair` extension for the completed response and the
+  `X-LLM-Language-Repair-Details` request header survives any gateway in
+  between. There is no proxy startup switch to enable: this client opts in on
+  every request, and an old, unsupported or missing extension simply prints
+  the fixed missing-original message. The default (transparent) proxy accepts
   `reasoning` on the main request; the legacy strict request validator does
   not, so point this client at a normal/transparent deployment.
-- Credentials, configuration values, headers and API error details are never
-  echoed; failures are fixed, actionable, content-free messages. HTTP
-  redirects are not followed, so credentials and prompts are never forwarded
-  to another origin.
+- Credentials, raw headers, API error details and tracebacks are never
+  echoed; failures are fixed, actionable, content-free messages. Selected
+  settings such as the model name and effort are intentionally displayed.
+  HTTP redirects are not followed, so credentials and prompts are never
+  forwarded to another origin.
 - Malformed streams, non-completed terminal states, premature EOF and
-  transport errors fail honestly: the answer is not committed and the next
-  request starts from only the new prompt.
+  transport errors fail honestly: the turn is not committed, and the next
+  request history keeps only the successful turns plus the new prompt.
+- It never starts an AI process, reads `auth.json` or performs OAuth, sends
+  tools or `previous_response_id`, retries, or keeps an on-disk transcript; it
+  supports the Responses wire API only, and it is not a full Codex client.
 
 Contract tests exercising the real script over an owned loopback HTTP server
 live in `tests/contract/test_repair_chat.py` (synthetic homes, catalogs and

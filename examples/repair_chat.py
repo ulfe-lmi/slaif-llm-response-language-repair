@@ -32,8 +32,10 @@ Deterministic configuration precedence (documented in examples/README.md):
   own model/provider/effort/catalog, and is not merged over the root.  If
   its provider table does not name the selected provider, the root
   ``model_providers`` definitions are consulted as a lookup only.
-* Per setting: command line > selected profile > root defaults > the
-  selected model's declared catalog default.
+* Per setting: command line > selected profile (table or standalone
+  file) > root defaults. The selected model's declared catalog default is
+  a fallback for the reasoning effort only; it never supplies a missing
+  model.
 """
 
 from __future__ import annotations
