@@ -85,6 +85,12 @@ model.
   and the reviewer thinking effort (default `low`) are operator settings.
   Longer eligible answers can get more spans corrected. See
   [INSTALL.md — Review policy configuration](INSTALL.md#review-policy-configuration).
+- **Opt-in repair details** — a client that sends
+  `X-LLM-Language-Repair-Details: 1` also receives one root
+  `llm_language_repair` field: the exact original final answer and the final
+  applied edits in Unicode code-point coordinates (original and delivered).
+  Off by default; the header is never forwarded upstream. See
+  [INSTALL.md — Original answer and applied-edit details](INSTALL.md#original-answer-and-applied-edit-details-opt-in).
 - **Fail-closed** — a missing or incompatible index, or a technical failure
   of the optional repair after safe completion, returns the completed original;
   truncated transport remains a transport failure. Ineligible or error
