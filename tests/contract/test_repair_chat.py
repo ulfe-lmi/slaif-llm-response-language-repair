@@ -1411,4 +1411,3 @@ def test_control_chars_in_slug_rendered_visibly(tmp_path: Path) -> None:
     assert "evil\\u001b[2Jx" in proc.stdout
     assert "\u001b" not in proc.stdout
     assert server.requests[0].json_body["model"] == slug
-
