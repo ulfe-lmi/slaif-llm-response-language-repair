@@ -28,6 +28,7 @@ import composed_validation
 import delivery_transport
 import header_transport
 import passthrough
+import repair_details
 import request_admission
 import request_lifecycle
 import sse_streaming
@@ -246,7 +247,10 @@ _UNSET: object = object()
 
 
 def transform_sse_blocks(
-    raw: bytes, repair: Callable[[str], str]
+    raw: bytes,
+    repair: Callable[[str], str],
+    details: Callable[[str, str, int | None, int | None], dict[str, object]]
+    | None = None,
 ) -> tuple[list[str], bool]:
     """Repair one unambiguously identified assistant text answer only.
 
@@ -686,7 +690,29 @@ def transform_sse_blocks(
         return _bypass_parts(), False
 
     new_text = repair(original_text)
-    if new_text == original_text:
+    if details is not None:
+        # Order 041-a, R5: the extension exists only in the actual
+        # terminal completion, once: the response object of the
+        # terminal response.completed event.  Early prefix frames are
+        # untouched (they are ordinal-identical and already delivered
+        # or validated before this point).  The hook consumes the
+        # request-local final outcome exactly once, with or without
+        # an accepted edit (no correction means exact original_text
+        # plus empty edits, never a missing object).
+        unit_event = parsed[unit_index]
+        if type(unit_event) is dict:
+            completed_response = unit_event.get("response")
+            if type(completed_response) is dict:
+                repair_details.attach(
+                    completed_response,
+                    details(
+                        original_text, new_text, output_pos, content_pos
+                    ),
+                )
+        # A non-dict completed response is unreachable (units are only
+        # collected from validated completed envelopes); the handler
+        # drains the unconsumed outcome on every path.
+    if new_text == original_text and details is None:
         # No accepted text edit: the raw bytes are returned unchanged.
         return _bypass_parts(), False
 
@@ -721,7 +747,7 @@ def transform_sse_blocks(
                         if isinstance(part, dict):
                             part["text"] = new_text
                             re_render = True
-        elif index in delta_indices:
+        elif index in delta_indices and new_text != original_text:
             # The first non-empty delta of the confirmed answer carries the
             # full repaired text; every later delta is emptied so the answer
             # is not duplicated.  Only the explicitly validated confirmed id
@@ -735,14 +761,25 @@ def transform_sse_blocks(
         if re_render:
             block = _render_event(block, value)
         output.append(block + delimiter)
-    return output, True
+    # The flag reports the ACTUAL text edit only (order 041-a R5): a
+    # metadata-only extension (details opted in, no accepted edit)
+    # changes wire bytes but is NOT an answer-text change; handler,
+    # cache-validator and Content-Length decisions key off the actual
+    # transformed bytes, not this flag.
+    return output, new_text != original_text
 
 
-def transform_sse(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool]:
+def transform_sse(
+    raw: bytes,
+    repair: Callable[[str], str],
+    details: Callable[[str, str, int | None, int | None], dict[str, object]]
+    | None = None,
+) -> tuple[bytes, bool]:
     """Public whole-body SSE transform: per-block output, joined and
-    UTF-8 encoded (byte-identical to the historical implementation).
+    UTF-8 encoded (byte-identical to the historical implementation
+    when the optional details hook is absent).
     """
-    parts, repaired = transform_sse_blocks(raw, repair)
+    parts, repaired = transform_sse_blocks(raw, repair, details)
     return "".join(parts).encode("utf-8"), repaired
 
 
@@ -859,7 +896,12 @@ def normalize_sse_body(raw: bytes) -> bytes:
     return "".join(parts).encode("utf-8")
 
 
-def transform_json(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, bool]:
+def transform_json(
+    raw: bytes,
+    repair: Callable[[str], str],
+    details: Callable[[str, str, int | None, int | None], dict[str, object]]
+    | None = None,
+) -> tuple[bytes, bool]:
     """Repair one completed JSON text answer with the same eligibility.
 
     Nonstreaming JSON is the primary supported path (order 015-a,
@@ -888,6 +930,34 @@ def transform_json(raw: bytes, repair: Callable[[str], str]) -> tuple[bytes, boo
         return raw, False
     original_text, part = found
     new_text = repair(original_text)
+    if details is not None:
+        # Order 041-a, R2: the actual answer part is located by proven
+        # object identity inside the validated envelope - a reasoning
+        # item preceding the answer or repeated identical text never
+        # shifts it to a substring/equality match.  The hook consumes
+        # the request-local final outcome exactly once, with or
+        # without an accepted edit; the reserved root field rule
+        # (collision) is applied on the envelope root only.
+        output_index: int | None = None
+        content_index: int | None = None
+        output = envelope.get("output")
+        if isinstance(output, list):
+            for output_pos, item in enumerate(output):
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for content_pos, candidate in enumerate(content):
+                    if candidate is part:
+                        output_index = output_pos
+                        content_index = content_pos
+        part["text"] = new_text
+        repair_details.attach(
+            envelope,
+            details(original_text, new_text, output_index, content_index),
+        )
+        return _safe_json_dumps(envelope), new_text != original_text
     if new_text == original_text:
         if metadata_removed:
             return (
@@ -970,6 +1040,15 @@ class RepairEngine:
     # observation and the abort observation are the only two
     # emitters, and exactly one of them may emit per request.
     _usage_observed: bool = False
+    # The request-local FINAL repair outcome (order 041-a, R3): the
+    # immutable (original, final_edits, repaired) triple set by
+    # repair() - the no-edit default on every fail-closed early path,
+    # the authoritative final surviving edits on the success return -
+    # and drained exactly once by the presentation hook or by the
+    # handler on normal completion.  It never crosses requests: reset
+    # on begin/abort and drained on success, so no original/repaired
+    # text is retained as a cross-request cache.
+    _repair_outcome: tuple[str, tuple[tuple[int, int, str], ...], str] | None = None
 
     def begin_request(
         self, scope: request_lifecycle.CancellationScope | None = None
@@ -980,6 +1059,7 @@ class RepairEngine:
         self._review_completed_calls = 0
         self._scope = scope
         self._usage_observed = False
+        self._repair_outcome = None
 
     def _raise_if_cancelled(self) -> None:
         # Phase-boundary check (order 030-a, requirement 4): a no-op
@@ -1051,6 +1131,7 @@ class RepairEngine:
         else:
             usage = "unknown"
         self.take_details()
+        self._repair_outcome = None
         self._review_usage = None
         self._scope = None
         if self._usage_observed:
@@ -1081,6 +1162,53 @@ class RepairEngine:
         details = self._details or []
         self._details = None
         return details
+
+    def take_repair_outcome(
+        self,
+    ) -> tuple[str, tuple[tuple[int, int, str], ...], str] | None:
+        """Drain THIS request's final repair outcome (order 041-a,
+        R3): (original, final edits, repaired).  Exactly one consumer
+        per request - the presentation hook, or the handler on normal
+        completion - and None when repair() never ran for this
+        request.  The drain clears the request-local slot so no
+        original/repaired text is retained across requests."""
+        outcome = self._repair_outcome
+        self._repair_outcome = None
+        return outcome
+
+    def take_repair_details(
+        self,
+        original: object,
+        delivered: object,
+        output_index: object,
+        content_index: object,
+    ) -> dict[str, object]:
+        """The request-local llm_language_repair object (order
+        041-a, R2/R4): consume the final outcome ONCE, require exact
+        identity with the transformed answer, and build strictly.
+        Any mismatch, proof failure, cap overflow or missing index
+        yields the fixed unavailable object - never a fabricated or
+        partial mapping.  Metadata extraction precedes the shared
+        trace/usage drains (the hook runs inside the transform)."""
+        outcome = self.take_repair_outcome()
+        if (
+            outcome is None
+            or outcome[0] is not original
+            or outcome[2] is not delivered
+        ):
+            return repair_details.unavailable(
+                repair_details.EDIT_MAPPING_UNAVAILABLE
+            )
+        # The untrusted index values pass through unmodified: the
+        # builder's strict type check turns any non-int (including
+        # None/bool) into the fixed unavailable object.
+        return repair_details.build_complete(
+            outcome[0],
+            outcome[1],
+            outcome[2],
+            output_index,  # type: ignore[arg-type]
+            content_index,  # type: ignore[arg-type]
+        )
 
     def _fail_closed_original(
         self, text: str, raw_started: float, reason: str | None, detail: str
@@ -1220,6 +1348,12 @@ class RepairEngine:
 
     def repair(self, text: str) -> str:
         raw_started = time.monotonic()
+        # Order 041-a, R3: the request-local final outcome defaults to
+        # the no-edit result (exact completed original) and is
+        # overwritten with the authoritative final surviving edits
+        # before the success return; every fail-closed early path
+        # keeps the no-edit default, which is exactly its outcome.
+        self._repair_outcome = (text, (), text)
         # Versioned finite analysis eligibility (order 025-a,
         # requirement 3): the ORIGINAL completed answer is checked on
         # its exact codepoint count first, then on its strict
@@ -1930,6 +2064,7 @@ class RepairEngine:
                     "stage": "late",
                 }
             self._details.append(detail)
+        self._repair_outcome = (text, tuple(edits), repaired)
         return repaired
 
 
@@ -2117,6 +2252,28 @@ class _Handler(BaseHTTPRequestHandler):
                         )
                     )
                     return
+                # Order 041-a, R1: the per-request opt-in control
+                # header is decided after the existing
+                # admission/intake/contract precedence and before any
+                # main/review work: duplicates or any other value are
+                # a fixed content-free 400, never reflected.  The
+                # header itself is stripped from the upstream forward
+                # below, and absent/off behavior is byte-identical.
+                try:
+                    details_on = repair_details.parse_details_values(
+                        repair_details.details_header_values(
+                            list(self.headers.items())
+                        )
+                    )
+                except repair_details.DetailsHeaderError:
+                    self._deliver(
+                        lambda: self._send_error_json(
+                            400,
+                            "invalid_request",
+                            repair_details.REPAIR_DETAILS_HEADER_INVALID,
+                        )
+                    )
+                    return
                 # One request-local cancellation scope begins AFTER the
                 # fully captured VALID ingress and BEFORE any main work
                 # (order 030-a, requirement 1): the exact accepted
@@ -2130,7 +2287,14 @@ class _Handler(BaseHTTPRequestHandler):
                 if hasattr(owner.engine, "begin_request"):
                     owner.engine.begin_request(scope)
                 scope.raise_if_cancelled()
-                forwarded = owner.forward(body, dict(self.headers))
+                forwarded = owner.forward(
+                    body,
+                    dict(
+                        repair_details.remove_details_header(
+                            list(self.headers.items())
+                        )
+                    ),
+                )
                 scope.raise_if_cancelled()
                 raw_seconds = time.monotonic() - started
                 repaired = forwarded.body
@@ -2167,10 +2331,23 @@ class _Handler(BaseHTTPRequestHandler):
                             )
                         )
                         return
+                    details_hook = (
+                        owner.engine.take_repair_details if details_on else None
+                    )
                     if contract.stream:
-                        repaired, _ = transform_sse(forwarded.body, owner.engine.repair)
+                        repaired, _ = transform_sse(
+                            forwarded.body, owner.engine.repair, details_hook
+                        )
                     else:
-                        repaired, _ = transform_json(forwarded.body, owner.engine.repair)
+                        repaired, _ = transform_json(
+                            forwarded.body, owner.engine.repair, details_hook
+                        )
+                    # Drain the request-local final outcome (already
+                    # consumed by the hook when opted in) so no
+                    # original/repaired text is retained across
+                    # requests; metadata extraction above precedes the
+                    # shared trace/usage drains below.
+                    owner.engine.take_repair_outcome()
                     scope.raise_if_cancelled()
                     if hasattr(owner.engine, "take_details") and hasattr(owner, "write_traces"):
                         details = owner.engine.take_details()
@@ -2340,8 +2517,12 @@ class _PassthroughHandler(_Handler):
         return True
 
     def _transform(
-        self, raw: bytes, media_type: str, scope: request_lifecycle.CancellationScope,
+        self,
+        raw: bytes,
+        media_type: str,
+        scope: request_lifecycle.CancellationScope,
         started: float,
+        details_on: int,
     ) -> bytes:
         owner = cast(ConceptProxy, self.server)
         # Malformed envelopes are opaque byte-identical passthrough.  A
@@ -2359,10 +2540,21 @@ class _PassthroughHandler(_Handler):
         except (ProxyError, ValueError, OverflowError, RecursionError):
             return raw
         owner.engine.begin_request(scope)
+        details_hook = (
+            owner.engine.take_repair_details if details_on else None
+        )
         if media_type == "application/json":
-            repaired, _changed = transform_json(raw, owner.engine.repair)
+            repaired, _changed = transform_json(
+                raw, owner.engine.repair, details_hook
+            )
         else:
-            repaired, _changed = transform_sse(raw, owner.engine.repair)
+            repaired, _changed = transform_sse(
+                raw, owner.engine.repair, details_hook
+            )
+        # Drain the request-local final outcome (already consumed by
+        # the hook when opted in) before the shared trace/usage
+        # drains; nothing text-bearing is retained across requests.
+        owner.engine.take_repair_outcome()
         details = owner.engine.take_details()
         owner.write_traces(uuid.uuid4().hex, details, time.monotonic() - started)
         owner.observe_usage(details)
@@ -2398,14 +2590,42 @@ class _PassthroughHandler(_Handler):
             if self._intake is not None and self._intake.release():
                 self._send_intake_error(408, "REQUEST_INTAKE_TIMEOUT")
                 return
+            # Order 041-a, R1: on the Responses route the opt-in
+            # control header is decided after the existing
+            # admission/intake precedence and before any main/review
+            # work (duplicates or any other value: fixed content-free
+            # 400, never reflected, zero main); on every other route it
+            # is only stripped from the relay below.
+            details_on = 0
+            if (
+                self.command == "POST"
+                and self.path.split("?", 1)[0] == "/v1/responses"
+            ):
+                try:
+                    details_on = repair_details.parse_details_values(
+                        repair_details.details_header_values(
+                            list(self.headers.items())
+                        )
+                    )
+                except repair_details.DetailsHeaderError:
+                    self._deliver(
+                        lambda: self._send_error_json(
+                            400,
+                            "invalid_request",
+                            repair_details.REPAIR_DETAILS_HEADER_INVALID,
+                        )
+                    )
+                    return
             scope = request_lifecycle.CancellationScope(self.connection)
             scope.start()
             cancelled = scope.cancelled
             # End-to-end headers (including authorization and vendor headers)
             # survive. Hop-by-hop headers, Host, and framing are reconstructed.
             excluded = passthrough.hop_headers(self.headers) | {"host", "content-length"}
-            headers = [(key, value) for key, value in self.headers.items()
-                       if key.lower() not in excluded]
+            headers = repair_details.remove_details_header(
+                [(key, value) for key, value in self.headers.items()
+                 if key.lower() not in excluded]
+            )
             if (body or self.command in {"POST", "PUT", "PATCH"}
                     or self.headers.get("Content-Length")):
                 headers.append(("Content-Length", str(len(body))))
@@ -2632,7 +2852,11 @@ class _PassthroughHandler(_Handler):
                             owner.engine.begin_request(scope)
                             try:
                                 blocks_out, _changed = transform_sse_blocks(
-                                    prefix, owner.engine.repair
+                                    prefix,
+                                    owner.engine.repair,
+                                    owner.engine.take_repair_details
+                                    if details_on
+                                    else None,
                                 )
                                 # Ordinal validation: the sent prefix
                                 # must equal the transform's own
@@ -2655,6 +2879,7 @@ class _PassthroughHandler(_Handler):
                                 else:
                                     tail = None
                             else:
+                                owner.engine.take_repair_outcome()
                                 details = owner.engine.take_details()
                                 owner.write_traces(
                                     uuid.uuid4().hex,
@@ -2700,7 +2925,9 @@ class _PassthroughHandler(_Handler):
                 if buffered:
                     scope.raise_if_cancelled()
                     original = prefix
-                    prefix = self._transform(prefix, media_type, scope, started)
+                    prefix = self._transform(
+                        prefix, media_type, scope, started, details_on
+                    )
                     transformed = prefix != original
             elif (
                 self.command == "POST"
