@@ -486,8 +486,7 @@ truncated original or edit list.
 - **Clients and gateways may ignore or drop the field.** It is an additive
   namespaced property; strict consumers of the Responses schema should skip
   unknown keys. Source-backed compatibility expectation only: the pinned
-  Codex `rust-v0.172.0` SSE parser source
-  (https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/codex-api/src/sse/responses.rs)
+  [Codex 0.172.0 parser](https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/codex-api/src/sse/responses.rs)
   selects only the known completed-response fields without
   `deny_unknown_fields`, so unknown keys are ignored and the repaired answer
   stays visible. Installed-binary (Codex `0.172.0`) and gateway E2E:
