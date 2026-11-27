@@ -2414,5 +2414,226 @@ class DetailsBypassNegativeTests(_DetailsCase):
         self.assertNotIn(_DETAILS_HEADER.lower(), main_headers)
 
 
+# ---------------------------------------------------------------------------
+# R7d30 legacy-engine interface compatibility (actual HTTP boundary):
+# the handler must keep working with a pre-041 engine that implements
+# only the old transport-supported interface (identity repair() -> str
+# plus the old lifecycle/trace/usage methods) and has NO new 041
+# ledger/details methods (take_repair_outcome, take_repair_details).
+# ---------------------------------------------------------------------------
+
+
+class _LegacyEngine:
+    """Pre-041 engine interface (R7d30): identity ``repair() -> str``
+    with a call counter, plus the OLD required lifecycle/trace/usage
+    methods (begin_request, abort_request, take_details,
+    mark_usage_observed).  Deliberately MISSING the new 041
+    ledger/details methods (take_repair_outcome, take_repair_details).
+    The fake engine is intentionally OUTSIDE the named handler
+    boundary: the actual proxy handler, guards, transforms and
+    delivery are all real; this is an interface-compatibility proof,
+    not a CPU proof."""
+
+    def __init__(self) -> None:
+        self.repair_calls = 0
+        self.calls: list[str] = []
+
+    def repair(self, value: str) -> str:
+        self.repair_calls += 1
+        self.calls.append("repair")
+        return value
+
+    def begin_request(self, scope: object) -> None:
+        self.calls.append("begin_request")
+
+    def abort_request(self, observer: object) -> None:
+        self.calls.append("abort_request")
+
+    def take_details(self) -> list[dict[str, object]]:
+        self.calls.append("take_details")
+        return []
+
+    def mark_usage_observed(self) -> None:
+        self.calls.append("mark_usage_observed")
+
+
+class DetailsLegacyEngineCompatTests(_DetailsCase):
+    """R7d30: the ACTUAL proxy handlers (named boundary here) with a
+    legacy engine that lacks the new 041 ledger/details methods.
+    Off: 200 with the exact prior text and normal fields (identity
+    legacy repair -> byte-identical completed JSON); on: 200 with the
+    same exact text plus the fixed
+    unavailable/EDIT_MAPPING_UNAVAILABLE field; exactly one repair
+    call, zero review calls, no new-method calls, and the control
+    header consumed from the main forward.
+
+    EXPECTED RED ON THE PRE-FIX RUNTIME (58455cc): the strict handler
+    calls owner.engine.take_repair_outcome() unconditionally
+    (proxy.py:2350, AttributeError -> 502) even when off, and
+    owner.engine.take_repair_details when opted in (proxy.py:2335);
+    the transparent _transform path calls them unguarded as well
+    (proxy.py:2544/2557).  All four cases fail 502 != 200 there;
+    they turn green on the primary's interface-compat fix.  Root
+    boundary evidence: root-041-first-legacy-failure-boundary.json
+    (do_POST line 2350, missing take_repair_outcome, 502)."""
+
+    def _swap_legacy_engine(self) -> _LegacyEngine:
+        if self.harness is not None:
+            self.harness.proxy_server.engine = _LegacyEngine()
+            return self.harness.proxy_server.engine
+        assert self.sse_harness is not None
+        self.sse_harness.proxy_server.engine = _LegacyEngine()
+        return self.sse_harness.proxy_server.engine
+
+    def _assert_legacy_calls(self, engine: _LegacyEngine) -> None:
+        # Exactly one repair, zero review, and the proxy never
+        # reached the new ledger/details methods (they do not exist
+        # on the legacy engine at all).
+        self.assertEqual(engine.repair_calls, 1)
+        self.assertNotIn("take_repair_outcome", engine.calls)
+        self.assertNotIn("take_repair_details", engine.calls)
+
+    def test_strict_off_legacy_engine_exact_prior_behavior(self) -> None:
+        # No control header: the completed JSON is delivered
+        # byte-identically through the identity legacy repair (the
+        # transform short-circuits on an unchanged text), with the
+        # old usage observation and no extension.
+        answer = _SHORT
+        self.harness = _Harness(answer, self.records, self.observed)
+        harness = self.harness
+        engine = self._swap_legacy_engine()
+        status, _headers, body = _strict_exchange_details(harness, [])
+        self.assertEqual(status, 200)
+        self.assertEqual(body, harness.source)
+        envelope = json.loads(body.decode("utf-8"))
+        self.assertEqual(
+            envelope["output"][0]["content"][0]["text"], answer
+        )
+        self.assertNotIn(_FIELD, envelope)
+        self._assert_legacy_calls(engine)
+        self.assertEqual(len(harness.reviewer.requests), 0)
+        self.assertEqual(len(harness.main_requests), 1)
+        # Old usage observation through the old take_details (empty).
+        self.assertEqual(
+            self.records,
+            [{"review_calls": 0, "reviewer_usage": "unknown"}],
+        )
+
+    def test_strict_on_legacy_engine_unavailable_field(self) -> None:
+        # Opted in with a legacy engine: 200, the SAME exact text as
+        # the off case, every other field equal to the upstream
+        # source, and the reserved root field is exactly the fixed
+        # unavailable/EDIT_MAPPING_UNAVAILABLE object (the engine
+        # cannot map the final outcome, so the fixed presentation
+        # fault is disclosed, not invented).
+        answer = _SHORT
+        self.harness = _Harness(answer, self.records, self.observed)
+        harness = self.harness
+        engine = self._swap_legacy_engine()
+        status, _headers, body = _strict_exchange_details(harness, ["1"])
+        self.assertEqual(status, 200)
+        envelope = json.loads(body.decode("utf-8"))
+        self.assertEqual(
+            envelope.get(_FIELD),
+            _unavailable("EDIT_MAPPING_UNAVAILABLE"),
+        )
+        expected = json.loads(harness.source.decode("utf-8"))
+        self.assertEqual(
+            envelope["output"][0]["content"][0]["text"], answer
+        )
+        del envelope[_FIELD]
+        self.assertEqual(envelope, expected)
+        self.assertEqual(body.count(b'"llm_language_repair"'), 1)
+        self._assert_legacy_calls(engine)
+        self.assertEqual(len(harness.reviewer.requests), 0)
+        # The control header is consumed from the main forward.
+        self.assertEqual(len(harness.main_requests), 1)
+        main_headers = {
+            key.lower(): value
+            for key, value in harness.main_requests[0]["headers"].items()
+        }
+        self.assertNotIn(_DETAILS_HEADER.lower(), main_headers)
+        self.assertEqual(
+            self.records,
+            [{"review_calls": 0, "reviewer_usage": "unknown"}],
+        )
+
+    def test_transparent_off_legacy_engine_exact_prior_behavior(self) -> None:
+        # Transparent handler, no control header: byte-identical
+        # completed JSON relay through the identity legacy repair,
+        # old usage observation, no extension.
+        answer = _SHORT
+        payload = _json_completed(answer)
+        self.sse_harness = _SseDetailsHarness(self.records, self.observed)
+        harness = self.sse_harness
+        harness.upstream(
+            before=payload, after=b"", content_type="application/json"
+        )
+        engine = self._swap_legacy_engine()
+        status, _headers, body = _post_raw(
+            harness.proxy_port, "/v1/responses", _contract_body(False), [],
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, payload)
+        envelope = json.loads(body.decode("utf-8"))
+        self.assertEqual(
+            envelope["output"][0]["content"][0]["text"], answer
+        )
+        self.assertNotIn(_FIELD, envelope)
+        self._assert_legacy_calls(engine)
+        self.assertEqual(harness.review_calls(), 0)
+        self.assertEqual(len(harness.main_requests()), 1)
+        self.assertEqual(
+            self.records,
+            [{"review_calls": 0, "reviewer_usage": "unknown"}],
+        )
+
+    def test_transparent_on_legacy_engine_unavailable_field(self) -> None:
+        # Transparent handler, opted in: 200, the SAME exact text as
+        # the off case, every other field equal to the upstream
+        # source, the fixed unavailable/EDIT_MAPPING_UNAVAILABLE
+        # field, and the control header consumed from the main
+        # forward.
+        answer = _SHORT
+        payload = _json_completed(answer)
+        self.sse_harness = _SseDetailsHarness(self.records, self.observed)
+        harness = self.sse_harness
+        harness.upstream(
+            before=payload, after=b"", content_type="application/json"
+        )
+        engine = self._swap_legacy_engine()
+        status, _headers, body = _post_raw(
+            harness.proxy_port,
+            "/v1/responses",
+            _contract_body(False),
+            [_DETAILS_HEADER.encode("ascii") + b": 1"],
+        )
+        self.assertEqual(status, 200)
+        envelope = json.loads(body.decode("utf-8"))
+        self.assertEqual(
+            envelope.get(_FIELD),
+            _unavailable("EDIT_MAPPING_UNAVAILABLE"),
+        )
+        expected = json.loads(payload.decode("utf-8"))
+        self.assertEqual(
+            envelope["output"][0]["content"][0]["text"], answer
+        )
+        del envelope[_FIELD]
+        self.assertEqual(envelope, expected)
+        self.assertEqual(body.count(b'"llm_language_repair"'), 1)
+        self._assert_legacy_calls(engine)
+        self.assertEqual(harness.review_calls(), 0)
+        requests = harness.main_requests()
+        self.assertEqual(len(requests), 1)
+        main_headers = {
+            key.lower(): value for key, value in requests[0]["headers"].items()
+        }
+        self.assertNotIn(_DETAILS_HEADER.lower(), main_headers)
+        self.assertEqual(
+            self.records,
+            [{"review_calls": 0, "reviewer_usage": "unknown"}],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
