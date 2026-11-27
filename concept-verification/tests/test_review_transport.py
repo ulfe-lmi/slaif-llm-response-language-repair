@@ -222,7 +222,7 @@ class FrameCodecTests(unittest.TestCase):
         # Length-inconsistent: header claims one more byte of body.
         head = bytearray(frame)
         struct.pack_into(
-            ">I", head, rt._REQUEST_HEADER.size - 4, rt._REQUEST_HEADER.unpack_from(frame, 0)[9] + 1
+            ">I", head, rt._REQUEST_HEADER.size - 12, rt._REQUEST_HEADER.unpack_from(frame, 0)[9] + 1
         )
         mutate("body_len_mismatch", bytes(head))
         # Non-UTF-8 host: rebuild with a one-byte host of 0xFF.
@@ -237,6 +237,8 @@ class FrameCodecTests(unittest.TestCase):
             0,
             1.0,
             len(b"{}"),
+            rt._BODY_MAX_BYTES,
+            rt._PAYLOAD_MAX_BYTES,
         ) + b"\xff" + b"/v1/responses" + b"{}"
         mutate("host_not_utf8", rebuilt)
         # Nonpositive remaining on the wire.
@@ -270,6 +272,8 @@ class FrameCodecTests(unittest.TestCase):
                 0,
                 1.0,
                 len(body),
+                rt._BODY_MAX_BYTES,
+                rt._PAYLOAD_MAX_BYTES,
             ) + b"h" + b"/p" + body
 
         over = raw(b"x" * (rt._BODY_MAX_BYTES + 1))
@@ -446,7 +450,7 @@ class _WorkerBase(unittest.TestCase):
 
 # Inline (no product import) response-frame writer for owned fake workers.
 _FAKE_RESPONSE = (
-    "frame = b'RRTX' + struct.pack('>BBBHI', 1, 2, {status_byte}, {http_status},"
+    "frame = b'RRTX' + struct.pack('>BBBHI', 2, 2, {status_byte}, {http_status},"
     " len(payload)) + payload\n"
     "sys.stdout.buffer.write(struct.pack('>Q', len(frame)) + frame)\n"
     "sys.stdout.buffer.flush()\n"
@@ -599,7 +603,7 @@ class WorkerSubprocessTests(_WorkerBase):
         worker = self._write(_fake_worker_script(
             "import struct\n"
             'payload = b\'{"ok": true}\'\n'
-            "frame = b'RRTX' + struct.pack('>BBBHI', 1, 2, 0, 200, len(payload)) + payload\n"
+            "frame = b'RRTX' + struct.pack('>BBBHI', 2, 2, 0, 200, len(payload)) + payload\n"
             "sys.stdout.buffer.write(struct.pack('>Q', len(frame)) + frame)\n"
             "sys.stdout.buffer.write(struct.pack('>Q', len(frame)) + frame)\n"
             "sys.stdout.buffer.flush()\n"
@@ -2060,13 +2064,17 @@ class ConstructorWiringTests(unittest.TestCase):
         # negative constructor boundary is exercised with exact types.
         bad_values: tuple[object, ...] = (
             True, False, 0, -1, 0.0, -0.5, float("nan"),
-            float("inf"), -float("inf"), "15", None,
+            float("inf"), -float("inf"), "15",
         )
         for bad in bad_values:
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 ResponsesReviewer(
                     "http://127.0.0.1:9/v1", "m", timeout=cast(float, bad)
                 )
+        # Omitted/None now means "use the configured policy timeout"
+        # (order 040-a, R3): the default policy is the 15 s cap.
+        reviewer = ResponsesReviewer("http://127.0.0.1:9/v1", "m", timeout=None)
+        self.assertEqual(reviewer.timeout, 15.0)
 
     def test_default_timeout_is_ordered_cap(self) -> None:
         self.assertEqual(REVIEWER_HTTP_TIMEOUT_SECONDS, 15.0)
@@ -2099,13 +2107,14 @@ class ConstructorWiringTests(unittest.TestCase):
                 timeout: float = REVIEWER_HTTP_TIMEOUT_SECONDS,
                 api_key: str | None = None,
                 profile: str | Path | None = None,
+                policy: object = None,
             ) -> None:
                 captured["timeout"] = timeout
                 captured["base_url"] = base_url
                 created_reviewers.append(self)
                 super().__init__(
                     base_url, model, timeout=timeout, api_key=api_key,
-                    profile=profile,
+                    profile=profile, policy=policy,
                 )
 
         class Port0Proxy(proxy.ConceptProxy):

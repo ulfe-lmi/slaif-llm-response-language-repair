@@ -325,12 +325,14 @@ class CancellationScope:
         self._watcher: threading.Thread | None = None
         self._started = False
         self._finished = False
-        # Request-local attempted-dispatch marker (order 030-a, R7):
-        # set by the parent side of the owned reviewer exchange AFTER
-        # the pure frame/request bounds and BEFORE the actual owned
-        # launch, so an interrupted exchange is distinguished from a
-        # pre-dispatch cancellation.
-        self._review_dispatch_attempted = False
+        # Request-local attempted-dispatch ledger (order 030-a, R7;
+        # extended to a count by order 040-a, R6): incremented by the
+        # parent side of the owned reviewer exchange AFTER the pure
+        # frame/request bounds and BEFORE the actual owned launch, so
+        # an interrupted exchange is distinguished from a pre-dispatch
+        # cancellation and sequential batches are counted 0..B at the
+        # real owned dispatch boundary.
+        self._review_dispatch_attempts = 0
 
     def cancelled(self) -> bool:
         """Whether a disconnect was observed for this request."""
@@ -338,11 +340,20 @@ class CancellationScope:
 
     def mark_review_dispatch_attempted(self) -> None:
         """Record one attempted owned reviewer dispatch (no-op-safe)."""
-        self._review_dispatch_attempted = True
+        self._review_dispatch_attempts += 1
 
     def review_dispatch_attempted(self) -> bool:
-        """Whether the owned reviewer dispatch was actually attempted."""
-        return self._review_dispatch_attempted
+        """Whether any owned reviewer dispatch was actually attempted.
+
+        The historical boolean interface is retained; the count itself
+        is exposed by :meth:`review_dispatch_attempts`."""
+        return self._review_dispatch_attempts > 0
+
+    def review_dispatch_attempts(self) -> int:
+        """The actual attempted-dispatch count for this request (0 for
+        a pre-dispatch cancellation; one per owned exchange actually
+        attempted, including mid-call cancellation/transport failure)."""
+        return self._review_dispatch_attempts
 
     def raise_if_cancelled(self) -> None:
         """Raise the dedicated contained exception at a phase boundary."""

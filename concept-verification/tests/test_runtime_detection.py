@@ -681,7 +681,9 @@ class PhraseGroupingSelectorTests(SelectorTestCase):
             ],
         )
 
-    def test_cap_default_four_and_hard_cap_eight(self) -> None:
+    def test_cap_is_maximum_without_hidden_cap(self) -> None:
+        # Order 040-a, R2: the runnable path has no hidden fixed
+        # eight-target ceiling; the selection maximum IS the cap.
         unigrams: tuple[tuple[str, int], ...] = (
             ("to", KNOWN),
             ("je", KNOWN),
@@ -712,7 +714,7 @@ class PhraseGroupingSelectorTests(SelectorTestCase):
         try:
             self.assertEqual(len(detect(text, corpus)), 4)
             elevated = detect(text, corpus, maximum=10)
-            self.assertEqual(len(elevated), 8)
+            self.assertEqual(len(elevated), 10)
             starts = [item[0] for item in _shape(elevated)]
             self.assertEqual(starts, sorted(starts))
         finally:

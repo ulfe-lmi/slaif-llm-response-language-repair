@@ -32,6 +32,7 @@ from config import (
     REVIEWER_HTTP_TIMEOUT_SECONDS,
 )
 from review_transport import ReviewTransportError, run_review_exchange
+from review_policy import DEFAULT_POLICY, ReviewPolicy
 
 # Exact repository-local versioned worker for the owned transport
 # child (order 019-a, requirement 2); executed by the running
@@ -130,28 +131,54 @@ class ResponsesReviewer:
         self,
         base_url: str,
         model: str,
-        timeout: float = REVIEWER_HTTP_TIMEOUT_SECONDS,
+        timeout: float | None = None,
         api_key: str | None = None,
         profile: str | Path | None = None,
+        policy: ReviewPolicy = DEFAULT_POLICY,
     ):
         parsed = urlparse(base_url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError("reviewer base URL must be an explicit HTTP URL")
         # Finite positive whole-exchange budget (order 019-a,
-        # requirement 1): validated at constructor entry; the value
-        # anchors one monotonic deadline at review_batch entry and is
-        # independent of CONCEPT_TIMEOUT and CONCEPT_HEADER_TIMEOUT.
+        # requirement 1; order 040-a, R3/R4): an explicitly supplied
+        # value stays the validated direct adapter; omitted, the
+        # CONFIGURED policy's timeout_seconds governs, so a custom
+        # policy never silently retains the old fixed 15-second
+        # constant.  A huge integer that overflows the float
+        # conversion is a nonfinite bound, not a crash.  The value
+        # anchors one monotonic deadline at review_batch entry (one
+        # fresh anchor per batch) and is independent of
+        # CONCEPT_TIMEOUT and CONCEPT_HEADER_TIMEOUT.
+        effective_timeout = (
+            policy.timeout_seconds if timeout is None else timeout
+        )
         if (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, (int, float))
-            or not math.isfinite(float(timeout))
-            or timeout <= 0
+            isinstance(effective_timeout, bool)
+            or not isinstance(effective_timeout, (int, float))
         ):
+            raise ValueError("reviewer timeout must be a finite positive duration")
+        if type(effective_timeout) is int:
+            try:
+                effective = float(effective_timeout)
+            except OverflowError:
+                raise ValueError(
+                    "reviewer timeout must be a finite positive duration"
+                ) from None
+        else:
+            effective = float(effective_timeout)
+        if not math.isfinite(effective) or effective <= 0:
             raise ValueError("reviewer timeout must be a finite positive duration")
         self.scheme, self.host = parsed.scheme, parsed.hostname
         self.port = parsed.port
         self.base_path = parsed.path.rstrip("/")
-        self.model, self.timeout = model, float(timeout)
+        self.model, self.timeout = model, effective
+        # Configured review policy (order 040-a): the typed immutable
+        # instance loaded once at the normal entry point and shared by
+        # the engine and this reviewer.  It carries the whole-exchange
+        # timeout default, the bounded output, the request/response
+        # byte caps (which reach the owned transport child/IPC framing
+        # and read limits) and the reviewer-only wire reasoning effort.
+        self.policy = policy
         self.api_key = api_key if api_key is not None else os.environ.get("QWEN_API_KEY")
         profile_name = (
             profile if profile is not None else os.environ.get("CONCEPT_REVIEWER_PROFILE")
@@ -230,13 +257,16 @@ class ResponsesReviewer:
         # One finite positive monotonic deadline anchored at entry,
         # before bounded prompt preparation, worker creation and IPC
         # (order 019-a, requirement 1); byte arrival, interim 100,
-        # phase transition and process startup never restart it.
+        # phase transition and process startup never restart it.  One
+        # fresh anchor per batch (order 040-a, R5): sequential
+        # batches each get the configured whole-exchange timeout.
         deadline = time.monotonic() + float(self.timeout)
-        prompt_text = build_prompt(targets)
+        policy = self.policy
+        prompt_text = build_prompt(targets, policy)
         if prompt_text is None:
             raise ReviewerError("review prompt exceeds bound", reason=REASON_PROMPT_OVERSIZE)
-        body = build_request_body(self.model, prompt_text)
-        if len(body) > REVIEW_BATCH_MAX_REQUEST_BYTES:
+        body = build_request_body(self.model, prompt_text, policy)
+        if len(body) > policy.max_request_bytes:
             raise ReviewerError("review request exceeds bound", reason=REASON_REQUEST_OVERSIZE)
         try:
             result_status, payload = run_review_exchange(
@@ -248,10 +278,12 @@ class ResponsesReviewer:
                 auth=self.api_key,
                 deadline=deadline,
                 worker_path=_REVIEW_WORKER_PATH,
+                request_max_bytes=policy.max_request_bytes,
+                response_max_bytes=policy.max_response_bytes,
             )
         except ReviewTransportError as exc:
             raise ReviewerError("review HTTP request failed", reason=REASON_HTTP_FAILED) from exc
-        if result_status != 200 or len(payload) > REVIEW_BATCH_MAX_RESPONSE_BYTES:
+        if result_status != 200 or len(payload) > policy.max_response_bytes:
             raise ReviewerError(
                 "review HTTP response was not successful", reason=REASON_HTTP_NOT_OK
             )

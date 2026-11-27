@@ -1,0 +1,73 @@
+# SLAIF repair proxy - reviewer policy (order 040-a).
+#
+# This is the shipped adjacent default. Normal startup selection is
+# deterministic: the CONCEPT_CONFIG environment variable, when set;
+# otherwise this shipped file - never any other historical or directory
+# search. (The Python loader API also accepts an explicit path argument
+# for tests and embedding; that is not a proxy startup option.)
+#
+# The [review] table affects reviewer requests ONLY. It never changes
+# main-request reasoning settings, main capture/intake/admission/delivery
+# budgets, the fixed exact-span/proposal/CPU-acceptance safety constraints
+# (128 cp target/replacement, 8 replacement words) or the analysis
+# eligibility gate.
+#
+# Every numeric field must be finite and strictly positive. Integer fields
+# must be exact integers (a boolean is rejected). timeout_seconds is a
+# finite positive number of seconds (integer or decimal). The legacy
+# CONCEPT_REVIEWER_TIMEOUT environment variable, when set, overrides
+# timeout_seconds only and is validated before bind.
+#
+# The selected file is loaded once at startup, before any listener, model
+# or corpus work. A missing, unreadable or malformed file, an unknown
+# section or key, a wrong type, a nonpositive or nonfinite bound, or an
+# unknown effort name refuses startup with a fixed content-free reason.
+# There is no hot reload; restart the proxy after editing.
+
+[review]
+# Review-call allowance: B = ceil(N / characters_per_call) where N is the
+# ORIGINAL completed eligible answer length in Unicode code points.
+# B is a maximum: no eligible suspicion means zero calls, and an empty
+# batch is never sent. N=0 permits 0; 1..1024 permits 1; 1025..2048
+# permits 2. The analysis gate (32,768 code points / 131,072 UTF-8 bytes)
+# still bypasses over-limit answers entirely, bounding the default B at 32.
+characters_per_call = 1024
+
+# CPU-selected occurrences are scaled to at most B * targets_per_call,
+# batched in consecutive groups of this many per fresh reviewer request
+# (each occurrence is batched at most once; no re-detection on edited
+# text). Sequential, at most one batch in flight, no retry.
+targets_per_call = 4
+
+# Bounded original context serialized per target occurrence, in code
+# points, on each side of the target.
+context_codepoints = 240
+
+# Maximum prompt size of one batch request in code points (instruction
+# plus serialized targets).
+max_prompt_codepoints = 8192
+
+# Bounded output of one batch request, in tokens.
+max_output_tokens = 1536
+
+# One batch request body, in bytes (integer 1..4,294,967,295). The cap
+# also bounds the owned transport child/IPC request framing.
+max_request_bytes = 32768
+
+# One batch response payload, in bytes (integer 1..4,294,967,295). The
+# cap also bounds the owned transport child read limit and the IPC
+# response framing.
+max_response_bytes = 32768
+
+# Absolute whole-exchange deadline for ONE batch, in seconds. It is
+# re-anchored per batch and covers process/IPC startup and the owned
+# child's resolver/connect/TLS/upload/status/header/body/result work.
+timeout_seconds = 15.0
+
+# Reviewer-only wire field, sent exactly as reasoning = { effort = "low" }
+# on every batch request. Standard names: none, minimal, low, medium,
+# high, xhigh, max.
+# Backend interpretation is provider-dependent; a rejected effort is never
+# silently downgraded or omitted - the batch fails and the completed
+# original is delivered.
+reasoning_effort = "low"

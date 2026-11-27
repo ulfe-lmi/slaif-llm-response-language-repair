@@ -3912,8 +3912,16 @@ class IntegrationTests(unittest.TestCase):
         rval = json.loads(cast(bytes, rrecord["body"]))
         self.assertEqual(
             set(rval),
-            {"model", "stream", "store", "max_output_tokens", "input"},
+            {
+                "model",
+                "stream",
+                "store",
+                "max_output_tokens",
+                "reasoning",
+                "input",
+            },
         )
+        self.assertEqual(rval["reasoning"], {"effort": "low"})
         self.assertEqual(rval["model"], "test-model")
         self.assertIs(rval["stream"], False)
         self.assertIs(rval["store"], False)

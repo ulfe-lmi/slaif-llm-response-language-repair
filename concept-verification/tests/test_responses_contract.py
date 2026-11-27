@@ -34,6 +34,7 @@ sys.path.insert(0, str(ROOT))
 import proxy  # noqa: E402
 from batch_review import BatchProposal, BatchTarget  # noqa: E402
 from pandoc_protection import PandocSpec  # noqa: E402
+from review_policy import DEFAULT_POLICY, ReviewPolicy  # noqa: E402
 from qwen_client import ResponsesReviewer  # noqa: E402
 from tests.test_review_batch import (  # noqa: E402
     TEXT,
@@ -195,6 +196,7 @@ class _Harness:
     def __init__(
         self,
         usage_observer: Callable[[dict[str, object]], None] | None = None,
+        policy: ReviewPolicy = DEFAULT_POLICY,
     ) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -221,8 +223,11 @@ class _Harness:
             "test-model",
             timeout=5.0,
             api_key=_REVIEW_KEY,
+            policy=policy,
         )
-        self.engine = proxy.RepairEngine(self.db, reviewer, pandoc=_real_spec())
+        self.engine = proxy.RepairEngine(
+            self.db, reviewer, pandoc=_real_spec(), policy=policy
+        )
         self.proxy_server = proxy.ConceptProxy(
             ("127.0.0.1", 0),
             f"http://127.0.0.1:{self.main_server.server_port}",

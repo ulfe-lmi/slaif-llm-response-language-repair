@@ -38,11 +38,11 @@ if _WORKER_DIR not in sys.path:
 
 from review_transport import (  # noqa: E402
     _FRAME_PREFIX,
-    _PAYLOAD_MAX_BYTES,
-    REQUEST_FRAME_MAX_BYTES,
     FrameIncomplete,
     FrameMalformed,
+    _REQUEST_HEADER,
     decode_request_frame,
+    decode_request_header,
     encode_response_frame,
 )
 
@@ -85,9 +85,22 @@ def main() -> int:
     try:
         prefix = _read_exact(0, _FRAME_PREFIX.size)
         (frame_len,) = _FRAME_PREFIX.unpack(prefix)
-        if frame_len == 0 or frame_len > REQUEST_FRAME_MAX_BYTES:
+        if frame_len == 0:
             return 3
-        request = decode_request_frame(_read_exact(0, frame_len))
+        # Version 2 (order 040-a, R3/R4 clarification): bound the body
+        # read from the frame's own validated header fields (bounded
+        # host/path/auth plus a body no larger than the frame's own
+        # configured request cap) instead of trusting the untrusted
+        # prefix length alone; a corrupted declaration is a contract
+        # violation, never an unbounded read.
+        head = _read_exact(0, _REQUEST_HEADER.size)
+        info = decode_request_header(head)
+        if _FRAME_PREFIX.size + frame_len != info.total_frame_bytes:
+            return 3
+        rest = _read_exact(
+            0, frame_len - _REQUEST_HEADER.size
+        )
+        request = decode_request_frame(head + rest)
     except (OSError, FrameMalformed, FrameIncomplete):
         return 3
     if _stdin_carries_trailing_bytes():
@@ -112,11 +125,15 @@ def main() -> int:
         # http.client mutates ``length`` to the remaining byte count as
         # read() consumes it; capture the declared value first.
         declared = result.length
-        payload = result.read(_PAYLOAD_MAX_BYTES + 1)
+        # The configured response cap from the request frame bounds the
+        # read (order 040-a, R3/R4 clarification): the one-byte
+        # over-read marker is retained for declared-length truncation
+        # detection and oversized-payload rejection.
+        payload = result.read(request.response_max_bytes + 1)
         if (
             declared is not None
             and len(payload) < declared
-            and len(payload) <= _PAYLOAD_MAX_BYTES
+            and len(payload) <= request.response_max_bytes
         ):
             # Incomplete declared delivery is a transport failure even
             # when the bytes already received parse as valid JSON and
@@ -135,7 +152,15 @@ def main() -> int:
         with contextlib.suppress(Exception):
             connection.close()
     try:
-        _write_all(1, encode_response_frame(ok=ok, http_status=http_status, payload=payload))
+        _write_all(
+            1,
+            encode_response_frame(
+                ok=ok,
+                http_status=http_status,
+                payload=payload,
+                payload_max_bytes=request.response_max_bytes,
+            ),
+        )
     except (OSError, FrameMalformed, FrameIncomplete):
         return 4
     return 0

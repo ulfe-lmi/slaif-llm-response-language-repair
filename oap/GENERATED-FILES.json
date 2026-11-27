@@ -16,14 +16,14 @@
    "sha256": "118be17b2e9e5b50d628c796b136ee1b8154ebf844af0007839f65848fd69f09"
   },
   "ARCHITECTURE-for-agents.md": {
-   "bytes": 20000,
+   "bytes": 19992,
    "class": "generated",
-   "sha256": "e52d30b391c1a84b96c706c09803e06b81b5a140755e851b6c59db13bd001a17"
+   "sha256": "1e8bb039022980ca51ef930a7fafeecfeb095061efb8076fafab443039018f52"
   },
   "ARCHITECTURE.md": {
-   "bytes": 56363,
+   "bytes": 64778,
    "class": "immutable",
-   "sha256": "6a93315cdbc24cee9124b7c187c4757f5531f3ee65be453d0db0471f511a35db"
+   "sha256": "3c7b9a734e2b9773480ea4b9f54ebeb8de36aa2e90c326a696ec3e0b829732a2"
   },
   "CRITICAL.md": {
    "bytes": 10684,
@@ -31,8 +31,8 @@
    "sha256": "a9ea5fa5db2affabf0f85710f41e37e73b108c0236a58b7efb9c17cb36a07e9e"
   },
   "INSTALL.md": {
-   "sha256": "df7ced04d3743a33f43680f25cbe7742c430285f72274292f14b99f5a62ea8ee",
-   "bytes": 16283,
+   "sha256": "271f38bf06bad76e6a72776d1572a1554b0eeb831a6348d2341daaeea5cacf8e",
+   "bytes": 22082,
    "class": "generated"
   },
   "LICENSE": {
@@ -51,14 +51,14 @@
    "sha256": "d2aa1d98cc5177ac6093ab3aeb79903b192780910ef2d1712839b474fb5adbf0"
   },
   "QUICKSTART.md": {
-   "sha256": "09b183daac6b0b26124d3ac371d63adbc82b48f305260fcc9bd7391ec4b91147",
-   "bytes": 3690,
+   "sha256": "6df9a7217fff9c138eb4a9c7fc9101f5c9e791236850874cbe529bb0cfe70c15",
+   "bytes": 3951,
    "class": "generated"
   },
   "README.md": {
-   "bytes": 5865,
+   "bytes": 6329,
    "class": "generated",
-   "sha256": "d66024c4b745ab1aec7b2fdc6bf97bda61a872ec69da943e949a5a7f5d8c5313"
+   "sha256": "7f933bc1fada1c781032a29f3e2bd173259a7efbcb2cfc65831a6e61d5490b51"
   },
   "SECURITY.md": {
    "bytes": 2266,
@@ -66,9 +66,9 @@
    "sha256": "1e3e9e59259ea6a57a3d8e368e896560c214f453c98792f7979e8d99b4154069"
   },
   "STATUS.md": {
-   "bytes": 4873,
+   "bytes": 4896,
    "class": "generated",
-   "sha256": "850a4b7ba34df36761c149fb5d0692952bade09f72df106ded106b3186ba3886"
+   "sha256": "2c5a99264f6e486fc2fb4cf9ceba1a4b1022219c1c6a7a14062cb3760d5e57bb"
   },
   "TESTING.md": {
    "bytes": 2310,
@@ -423,17 +423,17 @@
   "oap/governance/CONTEXT-BUDGET.md": {
    "bytes": 1253,
    "class": "generated",
-   "sha256": "81eb59f5b2d718c9e16bf9b220833915014271cf7d90da30c6eae3df4eb7bf54"
+   "sha256": "3f73dfc09b45e4509c2a38e2afcf906292fb3e740bada30623dfd9e84b857a17"
   },
   "oap/governance/DISTILLATION-MAP.md": {
-   "bytes": 72670,
+   "bytes": 73542,
    "class": "generated",
-   "sha256": "aaa945c445640937a231eb8e236f60e0085a13fe4f9a0afcabda3c052ad5b927"
+   "sha256": "8b53ab6a19bdfe627d29ef31835a1dff6326f85d0870d1ddf1eda35164730cdc"
   },
   "oap/governance/MANIFEST.json": {
-   "bytes": 76717,
+   "bytes": 77722,
    "class": "generated",
-   "sha256": "1b0d3523c79ffec82772059139b45c81bfeab9f251ff496f34d73bf737abd490"
+   "sha256": "0bdf551cf7934a9ccb27b63804b44ce8ee290649b88c80c547661dbaccb88baf"
   },
   "oap/governance/WORKSPACE-LAYOUT.json": {
    "bytes": 1131,
@@ -892,8 +892,8 @@
   },
   "docs/PROXY-CHAINING.md": {
    "class": "generated",
-   "sha256": "b11d719f3cdfed049b63885b075c1fcb61089ce4e9dd07df228bf011ba86283d",
-   "bytes": 4841
+   "sha256": "d487014bbbb52ba069316b5419d128a8987eca666e9b1d942c46cee532dc143d",
+   "bytes": 5207
   },
   "oap/tests/test_repository_rename.py": {
    "class": "generated",

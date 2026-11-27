@@ -98,12 +98,12 @@ EXPECTATIONS: dict[str, tuple[int, str | None, bool, bool, bool]] = {
     "sigint": (-2, "KeyboardInterrupt", True, True, False),
     "timeout_absent": (0, None, True, True, False),
     "timeout_45": (0, None, True, True, False),
-    "timeout_nonnumeric": (1, "ValueError", False, False, False),
-    "timeout_empty": (1, "ValueError", False, False, False),
-    "timeout_zero": (1, "ValueError", False, False, False),
-    "timeout_negative": (1, "ValueError", False, False, False),
-    "timeout_nan": (1, "ValueError", False, False, False),
-    "timeout_infinite": (1, "ValueError", False, False, False),
+    "timeout_nonnumeric": (1, "SystemExit", False, False, False),
+    "timeout_empty": (1, "SystemExit", False, False, False),
+    "timeout_zero": (1, "SystemExit", False, False, False),
+    "timeout_negative": (1, "SystemExit", False, False, False),
+    "timeout_nan": (1, "SystemExit", False, False, False),
+    "timeout_infinite": (1, "SystemExit", False, False, False),
 }
 
 INVALID_TIMEOUT_VALUES = {
@@ -592,6 +592,12 @@ class MainLifecycleTests(unittest.TestCase):
         )
 
     def test_invalid_reviewer_timeout_rejected_before_listener(self) -> None:
+        # 040-a R3: an invalid legacy reviewer timeout refuses
+        # startup with the fixed content-free reason before any
+        # validated construction or bound listener.
+        fixed_reason = (
+            "CONCEPT_REVIEWER_TIMEOUT must be a finite positive duration"
+        )
         for scenario in (
             "timeout_nonnumeric",
             "timeout_empty",
@@ -601,7 +607,31 @@ class MainLifecycleTests(unittest.TestCase):
             "timeout_infinite",
         ):
             with self.subTest(scenario=scenario):
-                self._assert_scenario(scenario)
+                lines, returncode, stderr = self._run_child(scenario)
+                self.assertEqual(returncode, 1, "\n".join(lines))
+                self.assertEqual(
+                    self._lines_by_prefix(lines, "MAIN_RAISED"),
+                    ["MAIN_RAISED SystemExit"],
+                    "\n".join(lines),
+                )
+                self.assertEqual(
+                    self._lines_by_prefix(lines, "MAIN_RETURN"),
+                    [],
+                    "\n".join(lines),
+                )
+                self.assertEqual(
+                    self._lines_by_prefix(lines, "SERVE_ENTRY"),
+                    [],
+                    "\n".join(lines),
+                )
+                self.assertEqual(
+                    self._lines_by_prefix(lines, "BOUND"),
+                    [],
+                    "\n".join(lines),
+                )
+                self.assertEqual(
+                    stderr, (fixed_reason + "\n").encode("utf-8")
+                )
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ On this page: [Prerequisites](#prerequisites-and-locations) · [Statistics
 and downloads](#statistics-licence-and-exact-downloads) · [Runtime
 index](#build-and-verify-the-runtime-index) · [Pandoc](#install-mandatory-pandoc)
 · [Configure and run](#configure-and-run-in-the-foreground) ·
+[Review policy](#review-policy-configuration) ·
 [SSH tunnel](#remote-client-ssh-tunnel) · [Stopping](#stopping-the-instance) ·
 [Upgrading](#upgrading) · [Recovery](#recovery) ·
 [Troubleshooting](#troubleshooting)
@@ -241,6 +242,108 @@ seconds before startup if needed for a busy endpoint.
 Send the first request from a second terminal, as in
 **[QUICKSTART.md](QUICKSTART.md#2-send-one-synthetic-request)**.
 
+## Review policy configuration
+
+The optional review phase reads one TOML policy file at startup, before any
+listener, model or corpus work. There are exactly two normal startup
+choices, in this order:
+
+1. the `CONCEPT_CONFIG` environment variable, when set;
+2. otherwise the shipped `concept-verification/repair-proxy.toml`.
+
+No other historical or directory search happens, and there is no hot reload:
+after editing, stop and restart the proxy. The selected file is loaded once,
+and the same immutable policy is applied to the reviewer and the repair
+engine.
+
+To tune the defaults without changing the tracked file, copy it to an owned
+location outside the checkout, edit the copy, and select it:
+
+```bash
+set -euo pipefail
+umask 077
+CONFIG_DIR="$HOME/.local/share/llm-slovenian-repair/config"
+mkdir -p "$CONFIG_DIR"
+if [ -e "$CONFIG_DIR/repair-proxy.toml" ] || [ -L "$CONFIG_DIR/repair-proxy.toml" ]; then
+  echo "keeping existing $CONFIG_DIR/repair-proxy.toml"
+else
+  cp concept-verification/repair-proxy.toml "$CONFIG_DIR/repair-proxy.toml"
+fi
+# edit $CONFIG_DIR/repair-proxy.toml
+export CONCEPT_CONFIG="$CONFIG_DIR/repair-proxy.toml"
+python3.12 -B concept-verification/proxy.py
+```
+
+The guard copies only when the destination does not exist, so an existing
+configured copy (or symlink) is preserved rather than silently overwritten.
+The
+[repair-proxy.toml](concept-verification/repair-proxy.toml) in the
+repository is the complete reference for every field, unit and default.
+
+Every `[review]` field affects reviewer requests only. Main-request
+reasoning settings, the main capture/intake/admission/delivery budgets and
+the fixed safety constraints are never changed. The selected file must
+contain the `[review]` table; omitted known fields take the documented
+defaults:
+
+| Field | Unit | Default | Meaning |
+| --- | --- | ---: | --- |
+| `characters_per_call` | code points | 1024 | One reviewer call is permitted per this many code points of the ORIGINAL completed answer: `B = ceil(N / characters_per_call)`. |
+| `targets_per_call` | count | 4 | Targets per batch; selection is capped at `B × targets_per_call`. |
+| `context_codepoints` | code points | 240 | Bounded original context serialized on each side of a target. |
+| `max_prompt_codepoints` | code points | 8192 | Maximum prompt of one batch request. |
+| `max_output_tokens` | tokens | 1536 | Bounded output of one batch request. |
+| `max_request_bytes` | bytes | 32768 | One batch request body; also bounds the owned transport framing. |
+| `max_response_bytes` | bytes | 32768 | One batch response payload; also bounds the owned transport read limit. |
+| `timeout_seconds` | seconds | 15.0 | Absolute whole-exchange deadline for ONE batch; re-anchored per batch. |
+| `reasoning_effort` | name | `"low"` | Reviewer-only wire field, sent as `reasoning = { "effort": … }`. |
+
+Standard effort names: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+`max`. The value is sent exactly as configured; whether the backend
+accepts it, and how it interprets it, depends on the selected model. A
+rejected effort is never silently downgraded or omitted — that batch fails
+and the completed original is delivered.
+
+- **The allowance is not the call count.** `B` is a maximum: no eligible
+  suspicion means zero calls, and empty batches are never sent. The
+  existing analysis gate (32,768 code points / 131,072 UTF-8 bytes) still
+  bypasses over-limit answers entirely, so at the defaults `B` is at most
+  32 (at most 128 targets, and at most 480 s of summed per-call review
+  waiting budget). That sum is a per-call waiting budget, not total observed
+  latency and not a guaranteed number of corrections: main generation, CPU
+  work, delivery and governed cleanup have their own separate budgets, and
+  no overall request deadline is implied.
+- **Short answer.** 2,000 code points, defaults: `B = ceil(2000/1024) = 2`
+  calls are permitted, up to 8 targets.
+- **Long answer.** 30,000 code points, defaults: `B = 30`, up to 120
+  targets in 30 sequential isolated batches.
+- **Fixed structural limits.** The proposal JSON bound (8,192 code points),
+  the 128 code-point target/replacement bound, the 8 replacement-word bound
+  and the independent CPU acceptance are safety constraints: they stay
+  unchanged even when the transport byte limits above are raised.
+- **Byte caps are framing-bounded.** `max_request_bytes` and
+  `max_response_bytes` are positive integers from 1 to 4,294,967,295 (the
+  transport framing limit); a larger positive value is refused at startup
+  with the fixed reason.
+- **Timeout override.** `CONCEPT_REVIEWER_TIMEOUT`, when set, overrides
+  `timeout_seconds` only (environment > file) and is validated with the
+  same rules before bind.
+- **Credentials stay outside the policy.** The file carries no keys,
+  endpoints or profiles; the existing endpoint/model/auth environment
+  behavior, including the optional external reviewer profile, is unchanged.
+- **Startup failure.** A missing, unreadable or malformed file, an unknown
+  section or key, a wrong type (including a boolean where an integer is
+  required), a nonpositive or nonfinite bound, or an unknown effort name
+  refuses startup with a fixed content-free reason before any listener,
+  model or corpus work. The reason names the field, never its value. Fix
+  the file (or unset `CONCEPT_CONFIG`) and restart.
+
+A batch failure (preparation, transport, structural or incomplete
+response) stops later batches and returns the completed original answer
+text; the unconditional defined-location logprobs removal still applies, and
+individually rejected but structurally valid proposals keep the existing
+independent behavior.
+
 ## Remote client (SSH tunnel)
 
 For a client on another host, use an authenticated SSH tunnel to this loopback
@@ -295,9 +398,10 @@ extra model process is launched, so there is nothing else to stop. If the
   and contact its owner; do not stop a service you do not own. The proxy
   defaults to loopback; use `CONCEPT_HOST` for an explicit IPv4 bind address.
 - **Startup rejected** — the proxy checks Pandoc presence, exact version and
-  positioned-JSON capability before binding, and validates the configuration
-  defaults before any listener is created. A failure message names the finite
-  reason; fix that specific cause.
+  positioned-JSON capability, and validates the selected review policy file
+  and the legacy `CONCEPT_REVIEWER_TIMEOUT` override before any listener is
+  created. A failure message names the finite reason without echoing values;
+  fix that specific cause and restart.
 - **A request returns `400`** — the request contract rejects unsupported
   capabilities (for example a request `logprobs` or `include` key) before any
   forward. Adjust the request to the supported text profile.

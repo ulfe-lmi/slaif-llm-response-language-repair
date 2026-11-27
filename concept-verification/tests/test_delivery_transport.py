@@ -56,6 +56,7 @@ from pandoc_protection import (  # noqa: E402
     PandocStartupError,
     check_pandoc,
 )
+from review_policy import DEFAULT_POLICY, ReviewPolicy  # noqa: E402
 from qwen_client import ResponsesReviewer  # noqa: E402
 from tests.test_capture_transport import (  # noqa: E402
     _BUILD_UNIGRAM,
@@ -2198,9 +2199,11 @@ class DeliveryChainTests(unittest.TestCase):
                             "stream",
                             "store",
                             "max_output_tokens",
+                            "reasoning",
                             "input",
                         },
                     )
+                    self.assertEqual(rval["reasoning"], {"effort": "low"})
                     self.assertEqual(rval["model"], "test-model")
                     self.assertIs(rval["stream"], False)
                     self.assertIs(rval["store"], False)
@@ -2646,6 +2649,7 @@ class DeliveryMainWiringTests(unittest.TestCase):
                     timeout: float = REVIEWER_HTTP_TIMEOUT_SECONDS,
                     api_key: str | None = None,
                     profile: str | Path | None = None,
+                    policy: ReviewPolicy = DEFAULT_POLICY,
                 ) -> None:
                     super().__init__(
                         base_url,
@@ -2653,6 +2657,7 @@ class DeliveryMainWiringTests(unittest.TestCase):
                         timeout=timeout,
                         api_key=api_key,
                         profile=profile,
+                        policy=policy,
                     )
 
             class Port0Proxy(proxy.ConceptProxy):
