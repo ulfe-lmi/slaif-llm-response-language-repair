@@ -39,6 +39,7 @@ import contextlib
 import shutil
 import json
 import os
+import signal
 import socket
 import sys
 import tempfile
@@ -46,6 +47,7 @@ import threading
 import time
 import unittest
 import subprocess
+from unittest import mock
 from pathlib import Path
 from typing import Callable
 
@@ -53,7 +55,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import proxy  # noqa: E402
-from qwen_client import ResponsesReviewer  # noqa: E402
+from qwen_client import ResponsesReviewer, _REVIEW_WORKER_PATH  # noqa: E402
 from tests.test_responses_contract import _json_completed  # noqa: E402
 from tests.test_review_batch import (  # noqa: E402
     _build_corpus,
@@ -62,6 +64,7 @@ from tests.test_review_batch import (  # noqa: E402
 )
 import request_lifecycle  # noqa: E402
 import composed_validation  # noqa: E402
+from review_transport import _child_environment  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Fixtures (synthetic; every detector-suspected word is corpus-unknown,
@@ -1368,10 +1371,63 @@ class MultibyteLengthBoundaryTests(_ScaledHarnessCase):
 import request_lifecycle  # noqa: E402
 
 
-def _owned_child_pids() -> set[int]:
-    """The pids of the live/zombie children of THIS test process."""
+# The REAL Popen constructor, bound at import time (before any test
+# can patch the module attribute): the witness delegates to this
+# exact object, never to the possibly-witnessed module global.
+_REAL_POPEN = subprocess.Popen
+
+# Exact owned-program identities (order 040-b, R5, root review):
+# FULLY QUALIFIED paths, no basename inference.  The worker path is
+# the very module constant the real reviewer transport passes to
+# the owned-child spawn (qwen_client._REVIEW_WORKER_PATH); the
+# pandoc path is resolved per check with the SAME expression the
+# harness engine used (_real_spec: qualified CONCEPT_PANDOC).
+_WORKER_ARGV_PATH = str(_REVIEW_WORKER_PATH)
+
+
+def _proc_start_ticks(pid: int) -> int | None:
+    """The /proc start identity (stat field 22) of a known PID, or
+    None when the PID does not exist: the durable identity half of
+    exact-child verification (a recycled PID shows a different start
+    identity or is absent).  A malformed/unavailable stat of an
+    EXISTING entry is never treated as proof of a gone child: it
+    raises instead of returning None."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    try:
+        return int(stat.rsplit(")", 1)[1].split()[19])
+    except (ValueError, IndexError) as exc:
+        raise ValueError(
+            f"malformed /proc stat for existing PID {pid}"
+        ) from exc
+
+
+def _proc_state(pid: int) -> str | None:
+    """The /proc state letter of an EXISTING PID, or None when the
+    PID is absent (already reaped/gone).  Used for the nonterminal
+    (live) half of the control-untouched proof WITHOUT reaping: for
+    a direct child, absent means reaped, and a present terminal
+    child can only be an unreaped zombie (Z).  A malformed stat of
+    an existing entry raises - it is never proof of a gone child."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    try:
+        return stat.rsplit(")", 1)[1].split()[0]
+    except (ValueError, IndexError) as exc:
+        raise ValueError(
+            f"malformed /proc stat for existing PID {pid}"
+        ) from exc
+
+
+def _child_identity_snapshot() -> dict[int, int]:
+    """{pid: start identity} of the live/zombie DIRECT children of
+    THIS test process (ppid scan, start-identity-augmented)."""
     my_pid = os.getpid()
-    pids: set[int] = set()
+    out: dict[int, int] = {}
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
@@ -1381,20 +1437,177 @@ def _owned_child_pids() -> set[int]:
             continue
         fields = stat.rsplit(")", 1)[1].split()
         if int(fields[1]) == my_pid:
-            pids.add(int(entry))
-    return pids
+            try:
+                out[int(entry)] = int(fields[19])
+            except (ValueError, IndexError):
+                continue  # transient malformed entry: lenient scan only
+    return out
 
 
-def _wait_no_children(limit: float = 10.0) -> set[int]:
-    """Bounded wait for the owned review-exchange child to be
-    terminated and reaped after an abort."""
+def _owned_child_pids() -> set[int]:
+    """The pids of the live/zombie children of THIS test process."""
+    return set(_child_identity_snapshot())
+
+
+def _wait_start_ticks(pid: int, limit: float = 5.0) -> int:
+    """Bounded wait for the start identity of a child just returned
+    by the REAL Popen constructor: the entry exists (live or zombie)
+    once the actual creation has completed.  A malformed stat of an
+    existing entry raises - it is never proof of a gone child."""
     deadline = time.monotonic() + limit
-    while time.monotonic() < deadline:
-        pids = _owned_child_pids()
-        if not pids:
-            return set()
+    while True:
+        ticks = _proc_start_ticks(pid)
+        if ticks is not None:
+            return ticks
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"owned child {pid} never materialized in bound"
+            )
+        time.sleep(0.005)
+
+
+def _is_worker_creation(args: list[str]) -> bool:
+    """EXACT ownership of a real owned exchange child: the full argv
+    contract of the runtime transport spawn - the qualified
+    interpreter, the fixed -I -S -B isolation flags, and the FULLY
+    QUALIFIED worker script path (the runtime's own module
+    constant, compared as a complete string: no basename, no
+    substring)."""
+    return (
+        len(args) == 5
+        and args[0] == sys.executable
+        and args[1:4] == ["-I", "-S", "-B"]
+        and args[4] == _WORKER_ARGV_PATH
+    )
+
+
+def _is_pandoc_creation(args: list[str]) -> bool:
+    """Exact ownership of the pinned-Pandoc child: argv0 is the
+    EXACT fully-qualified pandoc path the harness engine was
+    constructed with (same resolution expression, no basename
+    inference)."""
+    return bool(args) and args[0] == _real_spec().binary
+
+
+class _PopenWitness:
+    """Transparent actual-Popen creation call-through (order 040-b,
+    R5): every creation is delegated byte-for-byte to the REAL
+    subprocess.Popen (the same forwarding-observable-start boundary
+    the owned transport itself supports); the witness only REGISTERS
+    the exact creation (argv, pid, start identity) after the real
+    constructor returns.  It never alters behavior, never signals,
+    reaps or cleans: a 5 ms /proc poll can supplement this witness,
+    never establish it."""
+
+    def __init__(self) -> None:
+        self.created: list[tuple[list[str], int, int]] = []
+        self._lock = threading.Lock()
+
+    def __call__(self, args, *popen_args: object, **popen_kwargs: object):
+        proc = _REAL_POPEN(args, *popen_args, **popen_kwargs)
+        ticks = _wait_start_ticks(proc.pid)
+        with self._lock:
+            self.created.append((list(args), proc.pid, ticks))
+        return proc
+
+    def workers(self) -> list[tuple[list[str], int, int]]:
+        return [c for c in self.created if _is_worker_creation(c[0])]
+
+    def others(self) -> list[tuple[list[str], int, int]]:
+        return [c for c in self.created if not _is_worker_creation(c[0])]
+
+
+def _child_gone(identity: tuple[int, int], limit: float = 10.0) -> bool:
+    """Bounded wait until the EXACT child (pid + start identity) is
+    no longer present: absent (terminated and reaped) or the slot
+    already recycled to a different start identity (later PID reuse
+    is a different process, not our leaked child).  Returns False
+    while the same identity is still live or an unreaped zombie -
+    the leak this proof must catch."""
+    pid, ticks = identity
+    deadline = time.monotonic() + limit
+    while True:
+        current = _proc_start_ticks(pid)
+        if current is None or current != ticks:
+            return True
+        if time.monotonic() >= deadline:
+            return False
         time.sleep(0.02)
-    return _owned_child_pids()
+
+
+def _spawn_unrelated_finite_control(seconds: float) -> subprocess.Popen:
+    """One UNRELATED finite child of THIS test process (its own
+    fixture, reaped by the test only AFTER the ownership proof): it
+    outlives the exchange on its own clock and must remain untouched
+    - the proof may neither signal nor reap it, and its presence
+    must trigger no false leak report (order 040-b, R5)."""
+    proc = _REAL_POPEN(
+        [sys.executable, "-B", "-c", f"import time; time.sleep({seconds:.0f})"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if _proc_start_ticks(proc.pid) is not None:
+            return proc
+        time.sleep(0.005)
+    raise AssertionError("unrelated control child never materialized")
+
+
+def _reap_own_control(proc: subprocess.Popen, stored_ticks: int) -> None:
+    """Teardown of the test's OWN unrelated control fixture, called
+    only after every ownership assertion: terminate + reap the exact
+    child (never a force-reap before an assertion, never global).
+    The stored start identity is re-verified BEFORE any signal so a
+    recycled PID can never be touched; an already-absent child is
+    simply skipped (it cannot be signalled)."""
+    current = _proc_start_ticks(proc.pid)
+    if current is None:
+        return
+    if current != stored_ticks:
+        return  # recycled PID: never touch
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(proc.pid, signal.SIGKILL)
+    with contextlib.suppress(ChildProcessError, subprocess.TimeoutExpired):
+        proc.wait(timeout=10.0)
+
+
+class _NewChildObserver:
+    """SUPPLEMENTARY /proc observer over the dispatch window: at a
+    5 ms period it records (diagnostic evidence only) every direct
+    child that appears AFTER the baseline (pid + start identity).
+    It never signals, reaps or otherwise touches any process, and it
+    never establishes ownership - the actual-Popen witness does
+    (order 040-b, R5)."""
+
+    def __init__(self, baseline: dict[int, int]) -> None:
+        self._baseline = dict(baseline)
+        self._seen: dict[int, int] = {}
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="owned-child-observer", daemon=False
+        )
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            for pid, ticks in _child_identity_snapshot().items():
+                if pid in self._seen:
+                    continue
+                if self._baseline.get(pid) == ticks:
+                    continue  # pre-existing child, not ours
+                self._seen[pid] = ticks
+            self._stop.wait(0.005)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> dict[int, int]:
+        self._stop.set()
+        self._thread.join(10.0)
+        if self._thread.is_alive():
+            raise AssertionError("owned-child observer thread not joined")
+        return dict(self._seen)
 
 
 class _BarrierSpy:
@@ -1411,9 +1624,17 @@ class _BarrierSpy:
         self.calls = 0
         self.first_completed = threading.Event()
         self.halt_after_first: bool = False
+        # Optional transparent test-side delay before the FIRST real
+        # call is forwarded: lengthens the real owned exchange
+        # child's lifetime so the observer window deterministically
+        # captures its PID + start identity (no transport
+        # substitution, result unchanged).
+        self.first_call_delay: float = 0.0
 
     def review_batch(self, sentence: str, targets: object) -> object:
         self.calls += 1
+        if self.calls == 1 and self.first_call_delay:
+            time.sleep(self.first_call_delay)
         result = self._real.review_batch(sentence, targets)
         if self.halt_after_first and self.calls == 1:
             # Return the REAL first-call result only after the REAL
@@ -1441,7 +1662,12 @@ class CancellationMatrixTests(_ScaledHarnessCase):
     EXPECTED TO FAIL at the actual missing multi-batch behavior (no
     second dispatch ever happens, so the gate never becomes ready);
     the before/any-call and between-calls cases document the single-
-    call invariants the old runtime already satisfies.
+    call invariants the old runtime already satisfies.  Order 040-b,
+    R5: the no-leak claim is proven by a transparent actual-Popen
+    witness (exact qualified argv contract, PID + start identity),
+    not an absolute-emptiness scan: an unrelated pre-existing
+    control child must remain live and untouched, and a deliberately
+    unreaped owned child (negative control) must still be detected.
     """
 
     def _fin_exchange(self, harness: _Harness, ready: Callable[[], bool]) -> dict:
@@ -1513,6 +1739,70 @@ class CancellationMatrixTests(_ScaledHarnessCase):
             "error": state["error"],
         }
 
+    def _assert_owned_children_accounted_and_reaped(
+        self,
+        witness: _PopenWitness,
+        poller_new: dict[int, int],
+        expected_workers: int,
+    ) -> None:
+        # NONVACUOUS and EXACT (order 040-b, R5): every real review
+        # exchange is witnessed at the actual Popen boundary with
+        # the exact argv contract and the exact per-case count, so
+        # the proof cannot pass on an empty or unrelated capture.
+        self.assertEqual(len(witness.workers()), expected_workers)
+        # Every child spawned in the window is accounted: a review
+        # worker or the pinned-pandoc child - no unexpected owned
+        # spawn may go unaccounted, and EVERY accounted child (pid +
+        # start identity) is proven terminated AND reaped BEFORE
+        # fixture cleanup (absent, or the slot recycled to a
+        # different identity - later PID reuse is not our child).
+        for args, pid, ticks in witness.created:
+            self.assertTrue(
+                _is_worker_creation(args) or _is_pandoc_creation(args),
+                "unexpected owned child spawn (neither review worker "
+                f"nor pinned pandoc), argv0={Path(args[0]).name}",
+            )
+            self.assertTrue(
+                _child_gone((pid, ticks)),
+                f"owned child {pid} (start {ticks}) not terminated "
+                "and reaped before cleanup",
+            )
+        # Supplementary cross-check (the /proc poller supplements,
+        # never establishes, the witness): any post-baseline child
+        # the poller saw under a WITNESSED identity must be gone too;
+        # foreign/adopted children (not created through this
+        # process's Popen boundary) are never our account and can
+        # never trigger a false leak report.
+        for pid, ticks in poller_new.items():
+            if any(c[1] == pid and c[2] == ticks for c in witness.created):
+                self.assertTrue(
+                    _child_gone((pid, ticks)),
+                    f"witnessed owned child {pid} (start {ticks}) "
+                    "still present at proof time",
+                )
+
+    def _assert_preexisting_control_untouched(self, control: tuple[int, int]) -> None:
+        # The unrelated finite control child (spawned by THIS test,
+        # pre-existing for the exchange) is still LIVE under the
+        # SAME start identity: the proof neither signalled nor
+        # reaped it, and its presence triggered no false leak
+        # report.  Identity alone is insufficient (a killed but
+        # unreaped child keeps its pid + start identity as a
+        # zombie), so the nonterminal state is asserted WITHOUT
+        # reaping: for a direct child, absent means already reaped
+        # (gone); present + same identity + not terminal proves it
+        # is live.
+        cpid, cticks = control
+        self.assertEqual(_proc_start_ticks(cpid), cticks)
+        state = _proc_state(cpid)
+        self.assertIsNotNone(state, "unrelated control child absent (reaped/gone)")
+        self.assertNotIn(
+            state,
+            {"Z", "X", "x"},
+            f"unrelated control child {cpid} terminal (state {state!r}), "
+            "not a live untouched process",
+        )
+
     def test_cancellation_before_any_call_zero_calls_unknown_usage(self) -> None:
         answer = _long_answer()
         harness = _Harness(
@@ -1535,96 +1825,303 @@ class CancellationMatrixTests(_ScaledHarnessCase):
 
     def test_cancellation_between_calls_halts_later_dispatch(self) -> None:
         answer = _long_answer()
-        harness = _Harness(
-            answer,
-            self.records,
-            self.observed,
-            review_usage=[dict(UsageAggregationTests._U1), dict(UsageAggregationTests._U2)],
-        )
-        self.harness = harness
-        real_reviewer = ResponsesReviewer(
-            f"http://127.0.0.1:{harness.review_server.port}/v1",
-            "test-model",
-            timeout=8.0,
-            api_key="fake-key",
-        )
-        spy = _BarrierSpy(real_reviewer)
-        spy.halt_after_first = True
-        # Swap the harness engine's reviewer for the spy over the
-        # REAL reviewer BEFORE the exchange: the spy forwards every
-        # call to the real one (same transport target, same owned
-        # exchange) and only coordinates the barrier around the real
-        # first-call result and the real scope state.
-        harness.proxy_server.engine.reviewer = spy
-        self._fin_exchange(harness, spy.first_completed.is_set)
-        # Exactly one actual dispatch: the later batch was halted.
-        self.assertEqual(len(harness.reviewer.requests), 1)
-        self.assertEqual(spy.calls, 1)
-        # One attempted call with validated usage: aggregate is that
-        # call's known usage, never unknown and never zero.
-        self.assertEqual(
-            self.records,
-            [
-                {
-                    "review_calls": 1,
-                    "reviewer_usage": dict(UsageAggregationTests._U1),
-                }
-            ],
-        )
-        self.assertEqual(_wait_no_children(), set())
+        control_proc = _spawn_unrelated_finite_control(120.0)
+        control_ticks = _proc_start_ticks(control_proc.pid)
+        self.assertIsNotNone(control_ticks)
+        control = (control_proc.pid, control_ticks)
+        try:
+            harness = _Harness(
+                answer,
+                self.records,
+                self.observed,
+                review_usage=[dict(UsageAggregationTests._U1), dict(UsageAggregationTests._U2)],
+            )
+            self.harness = harness
+            real_reviewer = ResponsesReviewer(
+                f"http://127.0.0.1:{harness.review_server.port}/v1",
+                "test-model",
+                timeout=8.0,
+                api_key="fake-key",
+            )
+            spy = _BarrierSpy(real_reviewer)
+            spy.halt_after_first = True
+            spy.first_call_delay = 0.4
+            # Swap the harness engine's reviewer for the spy over
+            # the REAL reviewer BEFORE the exchange: the spy
+            # forwards every call to the real one (same transport
+            # target, same owned exchange) and only coordinates the
+            # barrier around the real first-call result and the
+            # real scope state.
+            harness.proxy_server.engine.reviewer = spy
+            before = _child_identity_snapshot()
+            observer = _NewChildObserver(before)
+            witness = _PopenWitness()
+            observer.start()
+            poller_new: dict[int, int] = {}
+            try:
+                with mock.patch.object(subprocess, "Popen", witness):
+                    result = self._fin_exchange(harness, spy.first_completed.is_set)
+                    # Quiet abort: no spurious byte on the closed
+                    # client, and the proxy actually closed the
+                    # connection (as in the other cancel cases).
+                    self.assertEqual(result["bytes"], b"")
+                    self.assertIs(result["eof"], True)
+                    # Exactly one actual dispatch: the later batch
+                    # was halted.
+                    self.assertEqual(len(harness.reviewer.requests), 1)
+                    self.assertEqual(spy.calls, 1)
+                    # One attempted call with validated usage:
+                    # aggregate is that call's known usage, never
+                    # unknown and never zero.
+                    self.assertEqual(
+                        self.records,
+                        [
+                            {
+                                "review_calls": 1,
+                                "reviewer_usage": dict(UsageAggregationTests._U1),
+                            }
+                        ],
+                    )
+            finally:
+                # Stop the supplementary observer (actually joined);
+                # the real Popen is restored by the context manager
+                # above.  Nothing is signalled, reaped or cleaned
+                # before the ownership proof.
+                poller_new = observer.stop()
+            # Exact owned-child ownership proof (order 040-b, R5):
+            # the real exchange child was witnessed at the actual
+            # Popen boundary (PID + start identity), and the
+            # product terminated AND reaped it BEFORE this test's
+            # fixture cleanup - while the unrelated pre-existing
+            # control child remains untouched under the same
+            # identity.
+            self._assert_owned_children_accounted_and_reaped(witness, poller_new, 1)
+            self._assert_preexisting_control_untouched(control)
+        finally:
+            _reap_own_control(control_proc, control_ticks)
 
     def test_cancellation_during_second_call_counts_two_unknown_usage_no_leak(
         self,
     ) -> None:
         answer = _long_answer()
-        harness = _Harness(
-            answer,
-            self.records,
-            self.observed,
-            review_usage=[dict(UsageAggregationTests._U1), dict(UsageAggregationTests._U2)],
-        )
-        self.harness = harness
-        # The second call's connection is never answered: the real
-        # owned exchange is in flight when the client FINs.
-        harness.reviewer.hold_from_call = 2
-
-        def ready() -> bool:
-            return (
-                len(harness.reviewer.call_events) >= 2
-                and harness.reviewer.call_events[1].is_set()
+        control_proc = _spawn_unrelated_finite_control(120.0)
+        control_ticks = _proc_start_ticks(control_proc.pid)
+        self.assertIsNotNone(control_ticks)
+        control = (control_proc.pid, control_ticks)
+        try:
+            harness = _Harness(
+                answer,
+                self.records,
+                self.observed,
+                review_usage=[dict(UsageAggregationTests._U1), dict(UsageAggregationTests._U2)],
             )
+            self.harness = harness
+            # The second call's connection is never answered: the
+            # real owned exchange is in flight when the client FINs.
+            harness.reviewer.hold_from_call = 2
+            # Transparent spy over the harness's REAL reviewer: the
+            # only effect is a bounded delay before the first real
+            # call is forwarded (no transport substitution, result
+            # unchanged), which lengthens the real first exchange
+            # child's lifetime so the supplementary observer window
+            # covers it; the ACTUAL ownership proof comes from the
+            # transparent Popen witness at the creation boundary.
+            real_reviewer = harness.proxy_server.engine.reviewer
+            spy = _BarrierSpy(real_reviewer)
+            spy.first_call_delay = 0.4
+            harness.proxy_server.engine.reviewer = spy
 
-        result = self._fin_exchange(harness, ready)
-        # Quiet abort: no spurious byte on the closed client, and the
-        # proxy actually closed the connection.
-        self.assertEqual(result["bytes"], b"")
-        self.assertIs(result["eof"], True)
-        # Both calls actually attempted at the owned dispatch
-        # boundary; the failed second call makes the aggregate
-        # unknown (the first call's known usage is never
-        # partial-as-total).
-        self.assertEqual(len(harness.reviewer.requests), 2)
-        self.assertEqual(
-            self.records,
-            [{"review_calls": 2, "reviewer_usage": "unknown"}],
+            def ready() -> bool:
+                return (
+                    len(harness.reviewer.call_events) >= 2
+                    and harness.reviewer.call_events[1].is_set()
+                )
+
+            before = _child_identity_snapshot()
+            observer = _NewChildObserver(before)
+            witness = _PopenWitness()
+            observer.start()
+            poller_new: dict[int, int] = {}
+            try:
+                with mock.patch.object(subprocess, "Popen", witness):
+                    result = self._fin_exchange(harness, ready)
+                    # Quiet abort: no spurious byte on the closed
+                    # client, and the proxy actually closed the
+                    # connection.
+                    self.assertEqual(result["bytes"], b"")
+                    self.assertIs(result["eof"], True)
+                    # Both calls actually attempted at the owned
+                    # dispatch boundary; the failed second call
+                    # makes the aggregate unknown (the first call's
+                    # known usage is never partial-as-total).
+                    self.assertEqual(len(harness.reviewer.requests), 2)
+                    self.assertEqual(
+                        self.records,
+                        [{"review_calls": 2, "reviewer_usage": "unknown"}],
+                    )
+                    # No request-local state leaks into the NEXT
+                    # request on the same owned proxy: a clean
+                    # answer observes zero calls and explicit
+                    # unknown usage (its pandoc child also lies
+                    # inside the witness window).
+                    harness.set_answer(_CLEAN)
+                    status, _headers, body = harness.exchange()
+                    self.assertEqual(status, 200)
+                    self.assertEqual(body, harness.source)
+                    self.assertEqual(len(harness.reviewer.requests), 0)
+                    self.assertEqual(
+                        self.records,
+                        [
+                            {"review_calls": 2, "reviewer_usage": "unknown"},
+                            {"review_calls": 0, "reviewer_usage": "unknown"},
+                        ],
+                    )
+            finally:
+                # Stop the supplementary observer (actually joined);
+                # the real Popen is restored by the context manager
+                # above.  Nothing is signalled, reaped or cleaned
+                # before the ownership proof.
+                poller_new = observer.stop()
+            # Exact owned-child ownership proof (order 040-b, R5):
+            # BOTH real exchange children were witnessed at the
+            # actual Popen boundary (PID + start identity, exact
+            # argv contract), and the product terminated AND reaped
+            # every one BEFORE this test's fixture cleanup - while
+            # the unrelated pre-existing control child remains
+            # untouched under the same identity.
+            self._assert_owned_children_accounted_and_reaped(
+                witness, poller_new, 2
+            )
+            self._assert_preexisting_control_untouched(control)
+        finally:
+            _reap_own_control(control_proc, control_ticks)
+
+    def test_owned_child_leak_negative_control_still_detected(self) -> None:
+        """Negative control for the R5 cleanup assertion: an owned
+        child that exits but is deliberately left UNREAPED (an
+        unreaped zombie - the exact lifecycle of a leaked exchange
+        child) MUST be reported present by the exact gone-check, so
+        the cleanup proof stays sensitive to real leaks and can
+        never pass vacuously.  The test's own fixture child is
+        reaped only AFTER the negative proof (no force-reap before
+        an assertion).  A narrow canary additionally invokes the
+        ACTUAL cleanup assertion with a nonvacuous REAL registered
+        review worker left live/unreaped (expected_workers=1) and
+        requires its leak failure - so the assertion being changed
+        itself is proven sensitive, not only its primitives."""
+        proc = _REAL_POPEN(
+            [sys.executable, "-B", "-c", "import time; time.sleep(300)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        # The owned exchange child was terminated and reaped.
-        self.assertEqual(_wait_no_children(), set())
-        # No request-local state leaks into the NEXT request on the
-        # same owned proxy: a clean answer observes zero calls and
-        # explicit unknown usage.
-        harness.set_answer(_CLEAN)
-        status, _headers, body = harness.exchange()
-        self.assertEqual(status, 200)
-        self.assertEqual(body, harness.source)
-        self.assertEqual(len(harness.reviewer.requests), 0)
-        self.assertEqual(
-            self.records,
-            [
-                {"review_calls": 2, "reviewer_usage": "unknown"},
-                {"review_calls": 0, "reviewer_usage": "unknown"},
-            ],
-        )
+        try:
+            ticks = _proc_start_ticks(proc.pid)
+            self.assertIsNotNone(ticks)
+            assert ticks is not None
+            proc.kill()
+            # Wait for the exit to land: the child is now an
+            # unreaped ZOMBIE of this process (state Z, same start
+            # identity) until this test reaps it in the finally.
+            stat = Path(f"/proc/{proc.pid}/stat")
+            state = None
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                try:
+                    state = stat.read_text().rsplit(")", 1)[1].split()[0]
+                except (FileNotFoundError, ProcessLookupError):
+                    break
+                if state == "Z":
+                    break
+                time.sleep(0.005)
+            self.assertTrue(
+                stat.exists(), "leak fixture exited before observation"
+            )
+            self.assertEqual(state, "Z", "leak fixture not an unreaped zombie")
+            self.assertEqual(_proc_start_ticks(proc.pid), ticks)
+            # The exact gone-check must flag the leak: the same pid
+            # + start identity is still present (never reaped).
+            self.assertFalse(
+                _child_gone((proc.pid, ticks), limit=2.0),
+                "unreaped owned child was not detected as a leak",
+            )
+            # The strengthened control-untouched assertion must
+            # ALSO reject this killed-but-unreaped child: identity
+            # alone (same pid + start identity) is insufficient
+            # because the zombie keeps it - the exact scenario the
+            # assertion's nonterminal state check exists to reject.
+            with self.assertRaises(AssertionError):
+                self._assert_preexisting_control_untouched((proc.pid, ticks))
+            # Canary for the ACTUAL cleanup assertion (root R5
+            # sensitivity probe): the checks above only prove the
+            # gone-check primitive and the control-untouched
+            # assertion; this canary invokes the assertion being
+            # changed with a NONVACUOUS REAL registered review
+            # worker left LIVE and unreaped (expected_workers=1)
+            # and requires its leak failure.  No fake witness
+            # entries: the worker is spawned through the very
+            # transparent witness at the exact runtime argv
+            # contract, with the runtime's own child environment,
+            # and it blocks on its private stdin pipe (no frame is
+            # ever written), so it is neither terminated nor
+            # reaped.  Cleanup happens only AFTER the proof.
+            witness = _PopenWitness()
+            in_read, in_write = os.pipe()
+            out_read, out_write = os.pipe()
+            worker_proc: subprocess.Popen | None = None
+            try:
+                worker_proc = witness(
+                    [sys.executable, "-I", "-S", "-B", str(_REVIEW_WORKER_PATH)],
+                    stdin=in_read,
+                    stdout=out_write,
+                    stderr=subprocess.DEVNULL,
+                    env=_child_environment(),
+                    close_fds=True,
+                )
+                # Nonvacuous: exactly one real worker registered at
+                # the actual Popen boundary (exact qualified argv
+                # contract) under the very identity the witness
+                # recorded, and it is LIVE, not terminal: blocked
+                # on its private stdin pipe.
+                self.assertEqual(len(witness.workers()), 1)
+                self.assertEqual(
+                    _proc_start_ticks(worker_proc.pid), witness.created[0][2]
+                )
+                self.assertNotIn(
+                    _proc_state(worker_proc.pid),
+                    {"Z", "X", "x"},
+                    "canary worker must be live, not terminal",
+                )
+                # The ACTUAL cleanup assertion must detect the
+                # live unreaped owned child as a leak (the exact
+                # leak path, not an accounting failure).
+                with self.assertRaises(AssertionError) as raised:
+                    self._assert_owned_children_accounted_and_reaped(
+                        witness, {}, 1
+                    )
+                self.assertIn(
+                    "not terminated and reaped", str(raised.exception)
+                )
+            finally:
+                # Cleanup only AFTER the proof: close the held pipe
+                # ends (EOF unblocks the worker's frame read), then
+                # terminate + reap the canary worker.
+                for fd in (in_write, out_read, in_read, out_write):
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+                if worker_proc is not None:
+                    with contextlib.suppress(ProcessLookupError):
+                        worker_proc.terminate()
+                    with contextlib.suppress(
+                        ChildProcessError, subprocess.TimeoutExpired
+                    ):
+                        worker_proc.wait(timeout=10.0)
+        finally:
+            # The test's OWN fixture child, reaped only AFTER the
+            # negative proof: no force-reap before an assertion.
+            with contextlib.suppress(ChildProcessError, subprocess.TimeoutExpired):
+                proc.wait(timeout=10.0)
+            self.assertIsNone(_proc_start_ticks(proc.pid))
 
 
 
