@@ -2068,6 +2068,50 @@ class RepairEngine:
         return repaired
 
 
+# Order 041-a, R2/R3/R4: the final-outcome ledger on the engine is an
+# OPTIONAL interface.  Legacy engines (including the existing minimal
+# concept tests) implement only repair(): they hold no request-local
+# outcome and prove no mapping.  The handler tolerates their absence
+# with fixed content-free decisions - never a broad catch or a
+# swallowed control - and an engine that implements the interface
+# (the actual RepairEngine) behaves exactly as before, including the
+# once-per-request drain.
+def _unavailable_details_hook(
+    original: object,
+    delivered: object,
+    output_index: object,
+    content_index: object,
+) -> dict[str, object]:
+    # The fixed content-free unavailable object for an opted-in
+    # request whose engine cannot prove the final edit mapping: the
+    # answer text, the review calls and every other wire decision are
+    # unchanged (order 041-a, R2/R4).
+    return repair_details.unavailable(
+        repair_details.EDIT_MAPPING_UNAVAILABLE
+    )
+
+
+def _details_hook_for(
+    engine: object, details_on: int
+) -> Callable[[str, str, int | None, int | None], dict[str, object]] | None:
+    # Off (0): no hook, byte-identical legacy transform.  On (1): the
+    # engine's own once-per-request hook when it implements the
+    # optional ledger, else the fixed unavailable-object hook.
+    if not details_on:
+        return None
+    take_details = getattr(engine, "take_repair_details", None)
+    return take_details if callable(take_details) else _unavailable_details_hook
+
+
+def _drain_repair_outcome(engine: object) -> None:
+    # Drain the request-local final outcome only from engines that
+    # implement the optional ledger: a legacy engine holds nothing, so
+    # its prior 200 path and bytes stand unchanged (order 041-a, R3).
+    drain = getattr(engine, "take_repair_outcome", None)
+    if callable(drain):
+        drain()
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "concept-verification/1"
     _intake: client_transport.IntakeGuard | None = None
@@ -2331,9 +2375,7 @@ class _Handler(BaseHTTPRequestHandler):
                             )
                         )
                         return
-                    details_hook = (
-                        owner.engine.take_repair_details if details_on else None
-                    )
+                    details_hook = _details_hook_for(owner.engine, details_on)
                     if contract.stream:
                         repaired, _ = transform_sse(
                             forwarded.body, owner.engine.repair, details_hook
@@ -2347,7 +2389,7 @@ class _Handler(BaseHTTPRequestHandler):
                     # original/repaired text is retained across
                     # requests; metadata extraction above precedes the
                     # shared trace/usage drains below.
-                    owner.engine.take_repair_outcome()
+                    _drain_repair_outcome(owner.engine)
                     scope.raise_if_cancelled()
                     if hasattr(owner.engine, "take_details") and hasattr(owner, "write_traces"):
                         details = owner.engine.take_details()
@@ -2540,9 +2582,7 @@ class _PassthroughHandler(_Handler):
         except (ProxyError, ValueError, OverflowError, RecursionError):
             return raw
         owner.engine.begin_request(scope)
-        details_hook = (
-            owner.engine.take_repair_details if details_on else None
-        )
+        details_hook = _details_hook_for(owner.engine, details_on)
         if media_type == "application/json":
             repaired, _changed = transform_json(
                 raw, owner.engine.repair, details_hook
@@ -2554,7 +2594,7 @@ class _PassthroughHandler(_Handler):
         # Drain the request-local final outcome (already consumed by
         # the hook when opted in) before the shared trace/usage
         # drains; nothing text-bearing is retained across requests.
-        owner.engine.take_repair_outcome()
+        _drain_repair_outcome(owner.engine)
         details = owner.engine.take_details()
         owner.write_traces(uuid.uuid4().hex, details, time.monotonic() - started)
         owner.observe_usage(details)
@@ -2850,13 +2890,14 @@ class _PassthroughHandler(_Handler):
                         scope.raise_if_cancelled()
                         if _sse_completed_ok(prefix):
                             owner.engine.begin_request(scope)
+                            details_hook = _details_hook_for(
+                                owner.engine, details_on
+                            )
                             try:
                                 blocks_out, _changed = transform_sse_blocks(
                                     prefix,
                                     owner.engine.repair,
-                                    owner.engine.take_repair_details
-                                    if details_on
-                                    else None,
+                                    details_hook,
                                 )
                                 # Ordinal validation: the sent prefix
                                 # must equal the transform's own
@@ -2879,7 +2920,7 @@ class _PassthroughHandler(_Handler):
                                 else:
                                     tail = None
                             else:
-                                owner.engine.take_repair_outcome()
+                                _drain_repair_outcome(owner.engine)
                                 details = owner.engine.take_details()
                                 owner.write_traces(
                                     uuid.uuid4().hex,
