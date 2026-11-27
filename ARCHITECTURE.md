@@ -2,16 +2,16 @@
 
 | | |
 | --- | --- |
-| Revision | 2.3, 2026-11-26 — current runnable architecture |
-| Prior revision | 2.2, SHA-256 `6a93315cdbc24cee9124b7c187c4757f5531f3ee65be453d0db0471f511a35db` |
-| Authorized base | `d39361c4b8f93981436da76a4a77d8cf6b48396c` |
+| Revision | 2.4, 2026-11-27 — current runnable architecture |
+| Prior revision | 2.3, SHA-256 `3c7b9a734e2b9773480ea4b9f54ebeb8de36aa2e90c326a696ec3e0b829732a2` |
+| Authorized base | `0c9c5dc848f82044e7dcace9a0405e88cdcc8f6d` |
 | Product agreement | [PLAN.md](PLAN.md) — protected, unchanged by this revision |
 | Compact projection | [ARCHITECTURE-for-agents.md](ARCHITECTURE-for-agents.md) |
 | DHA register | [CRITICAL.md](CRITICAL.md) |
 
-Revision 2.3 is the current revision: on the 2.2 minimal start-frame variant it replaces the fixed single-batch review with a **configurable length-scaled isolated review** — after complete main capture, one frozen-original CPU pass, a length-scaled call allowance B = ceil(N / characters_per_call) (default 1,024: 0 for empty, ≤32 at the default analysis gate), up to B sequential fresh isolated same-model batch-v1 requests, one immutable per-instance `[review]` policy loaded once at startup from the operator TOML, and the reviewer-only wire effort `reasoning = { "effort": … }` defaulting to `low`. The detailed selection, policy, per-batch and accounting rules are in [§9](#9-cpu-detection-and-target-selection), [§10](#10-isolated-qwen-review) and [§14](#14-bounded-resources-cancellation-and-failure).
+Revision 2.4 is the current revision: on the 2.3 configurable length-scaled review it adds the **opt-in original-answer and applied-edit details** — a private request header `X-LLM-Language-Repair-Details` (absent or one trimmed `0` off; one trimmed `1` on; duplicates or other values a fixed content-free `400` `REPAIR_DETAILS_HEADER_INVALID` on `POST /v1/responses` only, zero main work) that, on a supported completed `200` plain-answer response, adds exactly one root field `llm_language_repair` carrying the exact final original and delivered Unicode code-point coordinates of the actually applied edits, with fixed small `unavailable` objects (fixed reasons) for unavailable proof, size overflow or a reserved-field collision; the header is stripped from all upstream forwarding and never reaches the reviewer, and the extension is capped at 1,048,576 serialized bytes and never enters main history. The exact contract is in [§13.1](#131-opt-in-original-answer-and-applied-edit-details), the header failure row in [§5.2](#52-failure-and-error-contract), and the full change record in [§18.6](#186-current-revision-24-2026-11-27).
 
-Exact original spans, mandatory pinned Pandoc, strict independent acceptance, one composed validation, admission, evidence quotas, envelopes and failure semantics are retained; any batch preparation/transport/structural/incomplete failure stops later batches and returns the completed original answer text (defined-location logprobs removal still applies), and the request-local ledger counts actual owned dispatch attempts 0..B with known-or-unknown aggregate usage. This is a D0 bounded policy change under the pinned order; the full change record is in [§18.5](#185-current-revision-23-2026-11-26), the change-control law in [§18](#18-change-control-and-revision-record).
+The 2.3 length-scaled review — frozen-original CPU pass, allowance B = ceil(N / characters_per_call) (default 1,024: 0 for empty, ≤32 at the default analysis gate), up to B sequential fresh isolated same-model batch-v1 requests, one immutable per-instance `[review]` policy loaded once at startup, reviewer-only wire effort `reasoning = { "effort": … }` defaulting to `low` — is retained unchanged, as are exact original spans, mandatory pinned Pandoc, strict independent acceptance, one composed validation, admission, evidence quotas, envelopes and failure semantics; any batch preparation/transport/structural/incomplete failure still stops later batches and returns the completed original answer text (defined-location logprobs removal still applies), and the request-local ledger still counts actual owned dispatch attempts 0..B with known-or-unknown aggregate usage. This is a D0 additive metadata change under the pinned order; the change-control law is in [§18](#18-change-control-and-revision-record).
 
 On this page: [Purpose](#1-purpose-and-scope) · [Boundary](#2-system-boundary) ·
 [Invariants](#3-fixed-product-invariants) · [Components](#4-components-and-module-ownership)
@@ -159,6 +159,7 @@ modules below are the current runtime boundaries in `concept-verification/`:
 | Corpus | `runtime_corpus.py` | A strictly read-only index handle, opened only after the completed answer is admitted to analysis and closed on every path |
 | Review | `review_policy.py`, `batch_review.py`, `qwen_client.py`, `review_transport.py` | The immutable per-instance review policy (loaded once before listener/model/corpus work), the batch-v1 body and the sequential fresh batch requests (owned child/IPC transport carrying the configured caps); never writes files or mutates conversation state |
 | Acceptance and patch | `runtime_acceptance.py`, `composed_validation.py`, `repair.py` | Strict lexical acceptance, composed group recheck, exact patch |
+| Details | `repair_details.py` | The §13.1 opt-in contract: header values, the exact final-edit ledger proof (composition, arithmetic offsets, delivered-slice recheck), bounded size construction and the single root field; pure module, no I/O or state |
 | Delivery | handler worker in `proxy.py` | The final response under the delivery budget; the only place that turns a cancellation into the quiet abort |
 
 Each phase owns its own bounded resources (owned child processes, sockets,
@@ -210,7 +211,7 @@ flowchart TD
     p["Eligibility, Pandoc spans,<br/>bounded detection"]
     r["Sequential isolated review batches<br/>fresh strict-JSON, ≤B calls"]
     a["Strict acceptance<br/>and composed validation"]
-    d["Exact patch, logprobs removed,<br/>bounded delivery<br/>(stream: tail after sent prefix)"]
+    d["Exact patch, logprobs removed,<br/>opt-in details once at delivery (§13.1),<br/>bounded delivery<br/>(stream: tail after sent prefix, details terminal-only)"]
 
     v --> f --> c
     c -->|yes| p
@@ -307,6 +308,7 @@ this eligibility check — it never gates, enables or changes repair (§13).
 | Intake (transparent) | Absent `Content-Length` without `Transfer-Encoding` | accepted as an empty body | none |
 | Intake | Intake deadline expired mid-read | bounded best-effort `408` `REQUEST_INTAKE_TIMEOUT` | none |
 | Request contract (strict mode) | Unsupported capability or invalid request | `400` `invalid_request` + bounded reason | none; transparent mode relays non-eligible traffic |
+| Details header (both modes) | On `POST /v1/responses`, two or more `X-LLM-Language-Repair-Details` headers or a value other than one trimmed `0`/`1` (after admission, intake and contract precedence) | fixed content-free `400` `REPAIR_DETAILS_HEADER_INVALID`; value never reflected | none (before any main work); every other route strips the header without validating |
 | Main hop (both modes) | Upstream/setup/header/capture failure; a body that ends short of its declared length, detected inside the bounded capture before emission | `502` upstream protocol error before the response is emitted; for `stream: true` after emission starts, the §5.3 quiet-close contract | main attempted, no repair |
 | Main hop (strict mode) | 200 mode mismatch (declared `stream` versus observed content type); incomplete SSE without terminal; malformed main JSON (invalid UTF-8, duplicate keys, nonfinite numbers, non-object); over-limit body | `502` (`RESPONSE_MODE_MISMATCH` on mode mismatch) | main attempted or complete, no repair; transparent instead uses the actual content type, delivers the §5.3 tail, passes a malformed envelope through byte-identical and falls back to bounded raw passthrough |
 | Repair | Technical optional-stage failure (Pandoc, evidence, batch, transport); one rejected proposal is simply not applied | completed original for whole-pass failures; surviving edits delivered otherwise | main complete |
@@ -383,6 +385,11 @@ optional review waits are excluded and never arm or extend the clock. The
 buffered tail then goes out under one fresh delivery deadline anchored at its
 emission, and client cancellation aborts request-owned work without starting
 a new review.
+
+The §13.1 opt-in details are never part of the forwarded prefix and are
+never forwarded early: they appear exactly once, in the terminal
+`response.completed` event only, as part of the tail transform, and every
+prefix frame stays frame-identical to the no-header output.
 
 ## 6. Text, spans and the Pandoc original mapping
 
@@ -719,6 +726,84 @@ delivered. A metadata-only removal never sets the changed/text-edit flag. The
 request-side capability restriction is unchanged: a request `logprobs` or
 `include` key is rejected `400 REQUEST_UNSUPPORTED` before any forward.
 
+### 13.1 Opt-in original answer and applied-edit details
+
+Default off. A client opts in per request with the private control header
+`X-LLM-Language-Repair-Details`: absent or exactly one trimmed `0` is off;
+exactly one trimmed `1` is on; two or more headers, or any other value, is a
+fixed content-free `400` `REPAIR_DETAILS_HEADER_INVALID` on
+`POST /v1/responses` only (after admission, intake and contract precedence,
+before any main work; the value is never reflected). On every other route the
+header is stripped without being validated and the route relays exactly as
+before. The header is matched case-insensitively and is stripped from **all**
+upstream forwarding, including transparent non-Responses routes; it is never
+sent to the reviewer, never logged, and never reaches main history.
+
+On a supported completed `200` plain-answer response — the JSON response
+root, or the `response` object of the terminal `response.completed` event of a
+completed SSE stream — the proxy adds exactly one root field
+`llm_language_repair` with these contents:
+
+| Field | Value |
+| --- | --- |
+| `version` | `1` |
+| `status` | `"complete"` |
+| `offset_unit` | `"unicode_codepoints"` |
+| `output_index` | zero-based index of the actual answer part in the completed `output` list (a preceding reasoning item is counted) |
+| `content_index` | zero-based index of the answer `output_text` part |
+| `original_text` | the exact completed original answer text |
+| `edits` | one record per **final applied** correction: `{original_start, original_end, repaired_start, repaired_end, replacement}` |
+
+Coordinates are zero-based, inclusive start, exclusive end, **Unicode code
+points** (not UTF-8 bytes, not UTF-16 units, not model tokens) — original
+coordinates for `original_*`, delivered coordinates for `repaired_*`. The
+delivered answer is exactly `original_text` with the final replacements
+applied, and every delivered code point outside the repaired spans is an
+original code point. `edits` lists only the corrections that survived
+independent acceptance, conflict rollback and the one composed validation;
+candidate, rejected, rolled-back or aborted proposals never appear. When
+nothing was corrected, `original_text` is the exact original and `edits` is
+`[]`.
+
+The data are authoritative and request-local: the exact completed original,
+the final applied edit records and the delivered text come from the engine's
+immutable request-local final-patch state, never reconstructed from response
+diffs, substring matching, candidate or rejected proposals, or trace data.
+Every delivered `edits` record is a sorted, disjoint, valid, non-identity span
+set: `0 <= original_start < original_end <= original length`, `replacement`
+different from the original slice, exact composition back to the delivered
+text, `repaired_*` offsets derived arithmetically and each delivered slice
+rechecked against the delivered text. The request-local state is reset at
+request begin and on abort, and drained at normal finish independently of
+trace and usage draining; cancellation, non-ordinary termination and
+`MemoryError` keep their existing semantics, and no broad catch converts any
+failure into an `unavailable` object.
+
+Honest failures carry the same small fixed object with `status`
+`"unavailable"` and exactly one fixed content-free `reason`:
+`EDIT_MAPPING_UNAVAILABLE` (exact applied-edit proof unavailable),
+`DETAILS_TOO_LARGE` (the serialized extension exceeds 1,048,576 UTF-8 bytes —
+checked in the worst `ensure_ascii` serialization mode, so the bound holds for
+every encoding of the same content), or `UPSTREAM_FIELD_COLLISION` (the
+upstream response already carries a root `llm_language_repair` field; the
+reserved root field is replaced and the answer and other metadata are
+unchanged). The size check is bounded construction: cheap definite-overflow
+lower bounds before duplicating the original or the edit list, then the exact
+serialized measurement; no partial or truncated original or edit list is ever
+delivered.
+
+The extension is presentation metadata only: it never changes the repair
+decision, the delivered answer, review eligibility, usage accounting or any
+existing bound; no extra model call is made for it; it contains no reasoning,
+prompts, corpus evidence or rejected text; it appears at most once (JSON root;
+terminal SSE event only, never in a prefix frame); and it is never added to
+main history. Unsupported, non-completed, non-200, malformed, structured,
+stored or over-capture-fallback responses carry **no proxy-authored**
+`llm_language_repair`: the existing response semantics are retained (an
+unknown upstream field by that name may already be present untouched; defined
+`logprobs` removal still applies where recognized). A same-named field inside
+user data is never recursively removed.
+
 ## 14. Bounded resources, cancellation and failure
 
 Each phase runs under its own finite, independent budget (validated versioned
@@ -899,4 +984,16 @@ runtime law, and never rewrite historical seeds to hide a revision.
 | Classification | D0 under explicit owner product/resource/config decisions |
 | Scope | §4 module table and review-hop label; §5 lifecycle review-batch label; §9 selection allowance; §10 policy, sequential isolated batches, wire effort and per-batch bounds; §14 budgets/cancellation/accounting; new revision record; no change to exact-original spans, mandatory pinned Pandoc, strict independent acceptance, one composed pass, history/envelope/failure semantics, admission or protected resources |
 | Semantic delta | One frozen-original CPU pass with a length-scaled call allowance B = ceil(N / characters_per_call) (N = code points of the completed eligible original; 0 for empty; ≤32 at the default 32,768 cp analysis gate); CPU selection at most B × targets_per_call with no hidden fixed cap on the runnable path (frozen historical `detector.py` contract unchanged, not a production ceiling); the whole occurrence set is prepared and validated against the immutable original before dispatch, partitioned into consecutive batches of at most targets_per_call with globally unique response-local ids and exact original-coordinate mapping; up to B sequential fresh isolated same-model batch-v1 requests, at most one in flight, no retry or second generative pass; one immutable per-instance nine-field `[review]` policy (shipped adjacent `repair-proxy.toml` or `CONCEPT_CONFIG`, strict pre-bind validation without value/secret echo, no search or hot reload) with the SAME effective instance reaching engine and reviewer; each exchange keeps its own anchored absolute timeout (file `timeout_seconds`, legacy `CONCEPT_REVIEWER_TIMEOUT` environment override validated equally) plus configured prompt/output-token/request/response byte bounds that reach the parent checks AND the owned child/IPC framing and read limits (byte caps 1..4,294,967,295); reviewer-only wire `reasoning = { "effort": … }` exactly as configured (default `low`; standard names none/minimal/low/medium/high/xhigh/max, backend-dependent, never silently downgraded or omitted); raw-JSON output format explicit in the runnable instruction with the strict fenced/extra-output/schema rejection unchanged; any batch preparation/transport/structural/incomplete failure stops later batches and returns the completed original answer text (unconditional defined-location logprobs removal still applies); the request-local ledger counts actual owned dispatch attempts 0..B at the real dispatch boundary and the aggregate usage is known only when every attempted call has a completed result with validated usage (missing/invalid/failed stays unknown, never partial-as-total or zero; a pre-dispatch failure adds no attempt and retains earlier fully known cost; a cancellation between completed known calls retains the known aggregate); the fixed 128 cp target/replacement, 8 replacement-word and 8,192 cp proposal JSON bounds, the independent CPU acceptance, the 32,768 cp / 131,072 UTF-8 analysis gate, one-active admission and all evidence quotas are unchanged; at defaults the summed per-batch review waiting budget is at most B × timeout (480 s), a summed per-call budget, not total observed latency and not an overall request deadline |
+| Projections | Compact architecture, distillation map, manifest and generated-file identities synchronized in the same PR against the trusted accepted base |
+
+### 18.6 Current revision (2.4, 2026-11-27)
+
+| Field | Value |
+| --- | --- |
+| Prior revision | 2.3, SHA-256 `3c7b9a734e2b9773480ea4b9f54ebeb8de36aa2e90c326a696ec3e0b829732a2` |
+| Accepted base | `0c9c5dc848f82044e7dcace9a0405e88cdcc8f6d` |
+| Authorization | Order 041-a (pinned immutable), explicit owner 2026-11-27 original-answer and applied-edit metadata request, `llm_language_repair` name selection and go-ahead |
+| Classification | D0 additive final-response metadata under explicit owner product decisions |
+| Scope | §5 lifecycle delivery node and §5.2 details-header failure row; §5.3 terminal-only note; new §13.1 opt-in details contract; new revision record; no change to repair, parser, protection or budget policy, existing logprobs/other-metadata handling, exact-original spans, strict acceptance, composed validation, admission, protected resources or main history |
+| Semantic delta | One private opt-in request header `X-LLM-Language-Repair-Details` (absent or one trimmed `0` off; one trimmed `1` on; duplicates or other values a fixed content-free `400` `REPAIR_DETAILS_HEADER_INVALID` on `POST /v1/responses` only after admission/intake/contract precedence, zero main work; case-insensitive; stripped from all upstream forwarding including transparent non-Responses routes without validating them; never to the reviewer, never logged, never in main history). On a supported completed 200 plain-answer response (JSON response root or the terminal `response.completed` response object, once) exactly one root field `llm_language_repair` ({version 1, status "complete", offset_unit "unicode_codepoints", output_index, content_index, original_text, edits[] of {original_start, original_end, repaired_start, repaired_end, replacement}}) carries the exact final original and delivered Unicode code-point coordinates of the actually applied edits — final applied corrections only (post acceptance, conflict rollback and composed validation); no correction means the exact original text and `edits: []`. Unavailable exact proof, a serialized extension over 1,048,576 UTF-8 bytes (checked in the worst `ensure_ascii` mode via cheap definite-overflow lower bounds before duplicating the original/edit list, then exact serialized measurement), or an already-present upstream root field of the reserved name (replaced) deliver the same small fixed object with status "unavailable" and exactly one fixed content-free reason `EDIT_MAPPING_UNAVAILABLE` / `DETAILS_TOO_LARGE` / `UPSTREAM_FIELD_COLLISION`; no partial or truncated original or edit list. Unsupported, non-completed, non-200, malformed, structured, stored or over-capture-fallback responses receive no proxy-authored field and retain existing semantics (an unknown upstream field by that name may already be present untouched; defined `logprobs` removal still applies). The extension is presentation metadata: it never changes the repair decision, delivered answer, review eligibility, usage accounting or any existing bound, makes no extra model call, contains no reasoning, prompts, corpus evidence or rejected text, and is not added to main history. Codex compatibility is a source-backed expectation at the pinned official `rust-v0.172.0` parser (completed-response field selection without `deny_unknown_fields`), with installed-binary and gateway E2E recorded NOT RUN; actual product HTTP proof and actual pinned-source parser proof are separate evidence layers |
 | Projections | Compact architecture, distillation map, manifest and generated-file identities synchronized in the same PR against the trusted accepted base |

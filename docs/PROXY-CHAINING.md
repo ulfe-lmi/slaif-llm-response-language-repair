@@ -58,6 +58,13 @@ mode remains loopback-only.
   vendor fields, without JSON reserialization or field removal.
 - Client authorization and other end-to-end request headers; upstream status,
   body and end-to-end response headers, including repeated headers and errors.
+  The private per-request control header
+  `X-LLM-Language-Repair-Details` is the exception: the proxy consumes it and
+  strips it case-insensitively from the forwarded headers of **every** route.
+  It is effective only on `POST /v1/responses` (absent or one trimmed `0`
+  means off, one trimmed `1` opts in; duplicates or any other value are a
+  fixed content-free `400` there, with zero main calls); other routes relay
+  their request bodies and responses exactly as before.
 - Tool-call, structured, stored, background, incomplete and otherwise ineligible
   responses without repair, with defined logprobs removed where recognized.
 
@@ -90,6 +97,13 @@ reviewer, acceptance checks and defined logprobs removal remain in use. If bytes
 change, stale entity validators are removed and Content-Length is recomputed.
 Without eligible suspicion there are zero review calls. This forwarding change
 does not establish linguistic quality.
+
+With the opt-in header set, an eligible completed JSON or SSE response adds
+the single root `llm_language_repair` metadata field (original final answer
+plus the final applied edits in code-point coordinates); in streaming mode the
+unchanged prefix frames still arrive first and the metadata appears only in
+the terminal completion. The header never reaches the upstream. See
+[INSTALL.md — Original answer and applied-edit details](../INSTALL.md#original-answer-and-applied-edit-details-opt-in).
 
 ## Legacy strict mode
 

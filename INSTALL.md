@@ -344,6 +344,159 @@ text; the unconditional defined-location logprobs removal still applies, and
 individually rejected but structurally valid proposals keep the existing
 independent behavior.
 
+## Original answer and applied-edit details (opt-in)
+
+By default the proxy returns only the repaired answer. Any client that also
+wants the **original final answer text** and the exact **begin/end markers of
+the corrections that were actually applied** can ask for them per request with
+one header:
+
+```
+X-LLM-Language-Repair-Details: 1
+```
+
+The header is a private control: the proxy consumes it, never forwards it to
+the upstream or to the reviewer on any route, and it is not a startup setting.
+
+### Requesting the extension
+
+```bash
+curl -sS http://127.0.0.1:18024/v1/responses \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR-UPSTREAM-KEY' \
+  -H 'X-LLM-Language-Repair-Details: 1' \
+  -d '{
+    "model": "qwen3.8-27b-rtx3090", "store": false, "stream": false,
+    "input": [{"role": "user", "content": [
+        {"type": "input_text", "text": "Napiši en kratek stavek o sončnem dnevu."}
+    ]}]
+  }'
+```
+
+Header values:
+
+| Header values (on `POST /v1/responses`) | Effect |
+| --- | --- |
+| absent, or exactly one trimmed `0` | off (default; the response is exactly as before) |
+| exactly one trimmed `1` | on |
+| two or more headers, or any other value | `400` with the fixed content-free code `REPAIR_DETAILS_HEADER_INVALID`, before any main or review work; the value is never reflected |
+
+Validation applies only on `POST /v1/responses`; on every other route the
+header is stripped without being validated, and the route relays exactly as
+before. The header is matched case-insensitively and stripped from **all**
+upstream forwarding, including transparent non-Responses routes, which
+otherwise keep their existing relay behavior.
+
+### What comes back
+
+For a supported completed `200` plain-text answer (JSON response root, or the
+`response` object of the terminal `response.completed` event in a completed
+SSE stream) the proxy adds exactly one root field:
+
+```json
+{
+  "llm_language_repair": {
+    "version": 1,
+    "status": "complete",
+    "offset_unit": "unicode_codepoints",
+    "output_index": 1,
+    "content_index": 0,
+    "original_text": "abc def",
+    "edits": [
+      {
+        "original_start": 4,
+        "original_end": 7,
+        "repaired_start": 4,
+        "repaired_end": 7,
+        "replacement": "xyz"
+      }
+    ]
+  }
+}
+```
+
+In this example the original answer part was `abc def` (the answer message
+is the second output item, hence `output_index: 1`); the applied edit
+replaced code points 4..7 (`def`) with `xyz`, so the delivered answer is
+`abc xyz` — a same-length replacement, so the repaired offsets equal the
+original ones. A length-changing replacement shifts the following
+`repaired_*` offsets by the exact code-point difference.
+
+- `output_index` / `content_index` locate the actual answer part inside the
+  completed `output` list (a reasoning item before the answer is counted).
+- Offsets are **zero-based, inclusive start, exclusive end, Unicode
+  code points** — original coordinates for `original_*` and delivered
+  coordinates for `repaired_*`. They are **not** bytes, **not** model tokens,
+  and **not** JavaScript/browser `string[i]` indices: browsers index strings
+  in UTF-16 code units, so a surrogate-pair character (for example many
+  emoji) occupies two browser indices but one code point here. Convert with
+  `Array.from(text)` (code points), not with byte or UTF-16 lengths.
+- `edits` lists only the **final applied corrections** — the edits that
+  survived independent acceptance, conflict rollback and final patch
+  validation. Candidate, rejected, rolled-back or aborted proposals never
+  appear. When nothing was corrected, `original_text` is the exact original
+  and `edits` is `[]` (no extra call is made for that).
+- The object never contains reasoning, prompts, corpus evidence or rejected
+  text. It is presentation metadata: the normal answer stays the repaired
+  text, review behavior, cost and usage accounting are unchanged, and no
+  extra model calls are made.
+
+### Boundaries and honest failures
+
+The extension is optional presentation and never changes the repair decision
+or the delivered answer. When the complete mapping cannot be delivered, the
+field is the small fixed object below, with exactly one content-free reason:
+
+```json
+{
+  "llm_language_repair": {
+    "version": 1,
+    "status": "unavailable",
+    "reason": "DETAILS_TOO_LARGE"
+  }
+}
+```
+
+| Reason | Condition |
+| --- | --- |
+| `EDIT_MAPPING_UNAVAILABLE` | the exact applied-edit proof is unavailable |
+| `DETAILS_TOO_LARGE` | the serialized extension exceeds 1,048,576 UTF-8 bytes |
+| `UPSTREAM_FIELD_COLLISION` | the upstream response already carries a root `llm_language_repair` field; the reserved root field is replaced and the answer and other metadata are unchanged |
+
+Unsupported, non-completed, non-200, malformed, structured, stored or
+over-capture-fallback responses receive **no proxy-authored**
+`llm_language_repair` at all; the existing response semantics are retained —
+an unknown upstream field by that name may already be present untouched, and
+defined `logprobs` removal still applies where recognized.
+
+On any of these paths the answer, status, IDs, usage, citations and
+logprobs policy are exactly as without the header; there is no partial or
+truncated original or edit list.
+
+### Payload and compatibility notes
+
+- **Payload duplication.** Opting in duplicates the original answer text
+  inside the response, so the delivered payload can be close to double the
+  answer size (the extension itself is capped at 1,048,576 **serialized**
+  bytes — the JSON bytes including escaping and the fixed field records,
+  checked in the worst ASCII-escaped serialization mode, not a 1 MiB
+  raw-text allowance: a long original with many non-ASCII code points
+  serializes larger than its raw length). Use the header only when a
+  client actually needs the data.
+- **Clients and gateways may ignore or drop the field.** It is an additive
+  namespaced property; strict consumers of the Responses schema should skip
+  unknown keys. Source-backed compatibility expectation only: the pinned
+  [Codex 0.172.0 parser](https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/codex-api/src/sse/responses.rs)
+  selects only the known completed-response fields without
+  `deny_unknown_fields`, so unknown keys are ignored and the repaired answer
+  stays visible. Installed-binary (Codex `0.172.0`) and gateway E2E:
+  **NOT RUN**.
+- **No new logging.** The header value and the extension content are never
+  logged; `CONCEPT_TRACE_DIR` tracing behavior is unchanged.
+- **Streaming.** In a completed SSE stream the prefix frames (including
+  early reasoning) are unchanged and arrive first; the extension appears
+  once, in the terminal `response.completed` event only.
+
 ## Remote client (SSH tunnel)
 
 For a client on another host, use an authenticated SSH tunnel to this loopback

@@ -16,14 +16,14 @@
    "sha256": "118be17b2e9e5b50d628c796b136ee1b8154ebf844af0007839f65848fd69f09"
   },
   "ARCHITECTURE-for-agents.md": {
-   "bytes": 19992,
+   "bytes": 19985,
    "class": "generated",
-   "sha256": "1e8bb039022980ca51ef930a7fafeecfeb095061efb8076fafab443039018f52"
+   "sha256": "cec7d29a7345d450d1b04543f4d5d94f9a60a056a7bf6179f173c03cee2e352e"
   },
   "ARCHITECTURE.md": {
-   "bytes": 64778,
+   "bytes": 74822,
    "class": "immutable",
-   "sha256": "3c7b9a734e2b9773480ea4b9f54ebeb8de36aa2e90c326a696ec3e0b829732a2"
+   "sha256": "2f1a61d5488fc430a29b4e0e195582c07b95936762d3b86e28eafc1327c26fa1"
   },
   "CRITICAL.md": {
    "bytes": 10684,
@@ -31,9 +31,9 @@
    "sha256": "a9ea5fa5db2affabf0f85710f41e37e73b108c0236a58b7efb9c17cb36a07e9e"
   },
   "INSTALL.md": {
-   "sha256": "271f38bf06bad76e6a72776d1572a1554b0eeb831a6348d2341daaeea5cacf8e",
-   "bytes": 22082,
-   "class": "generated"
+   "bytes": 28833,
+   "class": "generated",
+   "sha256": "632ef7590b83bc1e87682604da20dac42b765670217e4564daa15ab0ae618c9f"
   },
   "LICENSE": {
    "bytes": 11357,
@@ -51,14 +51,14 @@
    "sha256": "d2aa1d98cc5177ac6093ab3aeb79903b192780910ef2d1712839b474fb5adbf0"
   },
   "QUICKSTART.md": {
-   "sha256": "6df9a7217fff9c138eb4a9c7fc9101f5c9e791236850874cbe529bb0cfe70c15",
-   "bytes": 3951,
-   "class": "generated"
+   "bytes": 4433,
+   "class": "generated",
+   "sha256": "0eb82765bddbda38a5c030abd19757003b7659b8d97cf4562b1b9d67db32b862"
   },
   "README.md": {
-   "bytes": 6329,
+   "bytes": 6777,
    "class": "generated",
-   "sha256": "7f933bc1fada1c781032a29f3e2bd173259a7efbcb2cfc65831a6e61d5490b51"
+   "sha256": "abb7107879585e8913af139487fd307f16697f8714359c511cb149cb2f12c23b"
   },
   "SECURITY.md": {
    "bytes": 2266,
@@ -423,17 +423,17 @@
   "oap/governance/CONTEXT-BUDGET.md": {
    "bytes": 1253,
    "class": "generated",
-   "sha256": "3f73dfc09b45e4509c2a38e2afcf906292fb3e740bada30623dfd9e84b857a17"
+   "sha256": "d1089916565468f2d909429c127754acb591b047ee8c447383a99bacf25e3774"
   },
   "oap/governance/DISTILLATION-MAP.md": {
-   "bytes": 73542,
+   "bytes": 71781,
    "class": "generated",
-   "sha256": "8b53ab6a19bdfe627d29ef31835a1dff6326f85d0870d1ddf1eda35164730cdc"
+   "sha256": "d600b7f3b189eef055b884d785f5d9207a3acdca1a80a9ee201a3a25e2501a2d"
   },
   "oap/governance/MANIFEST.json": {
-   "bytes": 77722,
+   "bytes": 76088,
    "class": "generated",
-   "sha256": "0bdf551cf7934a9ccb27b63804b44ce8ee290649b88c80c547661dbaccb88baf"
+   "sha256": "9e13afc0a1b01cedfa03358a2a2679113c7131acbddc468e99221f8b6f4776e3"
   },
   "oap/governance/WORKSPACE-LAYOUT.json": {
    "bytes": 1131,
@@ -891,9 +891,9 @@
    "bytes": 7522
   },
   "docs/PROXY-CHAINING.md": {
+   "bytes": 6182,
    "class": "generated",
-   "sha256": "d487014bbbb52ba069316b5419d128a8987eca666e9b1d942c46cee532dc143d",
-   "bytes": 5207
+   "sha256": "0179c0fd1de87914d90844f3412f29f00b6aba5c6d60186398c87fb152d7c220"
   },
   "oap/tests/test_repository_rename.py": {
    "class": "generated",

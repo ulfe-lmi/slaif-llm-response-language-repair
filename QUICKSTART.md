@@ -86,3 +86,11 @@ The optional review phase uses the shipped review policy by default; the full
 nine settings (review-call allowance, batch bounds, timeout, thinking effort)
 are documented in
 [INSTALL.md — Review policy configuration](INSTALL.md#review-policy-configuration).
+
+A client that also wants the original final answer text and the begin/end
+markers of the corrections that were actually applied (returned as the root
+`llm_language_repair` field) sends one extra header,
+`X-LLM-Language-Repair-Details: 1`; absent or `0` returns exactly the default
+response. See
+[INSTALL.md — Original answer and applied-edit details](INSTALL.md#original-answer-and-applied-edit-details-opt-in)
+for the field schema, code-point coordinates and boundary behavior.
