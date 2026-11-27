@@ -61,5 +61,5 @@ jobs:
       - name: Assert protected scientific surfaces are unchanged
         run: git diff --exit-code 4507cc78e333c0e48226b64266121171b7b8cea8 -- PLAN.md CRITICAL.md oap/bootstrap-sources.lock.json docs/bootstrap
 
-      - name: Candidate governance review bound to order 041-a
-        run: python3.12 oap/bin/oap_cli.py candidate-review --repo-root . --order oap/orders/041-a-language-repair-details.md --order-sha256 46fabca55979e26044903760d5aa392fa7db20d39cedfd59c1278403917cc046 --accepted-ref 0c9c5dc848f82044e7dcace9a0405e88cdcc8f6d --order-id 041-a
+      - name: Candidate governance review bound to order 042-a
+        run: python3.12 oap/bin/oap_cli.py candidate-review --repo-root . --order oap/orders/042-a-terminal-comparison-client.md --order-sha256 52fa84daf5b0c56fd8c7ea95de7defee266ea1bb5898f183d95cb4de95203aca --accepted-ref 8fc78802c907203c6cf7b8be9fa5609690890e26 --order-id 042-a
