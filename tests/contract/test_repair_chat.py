@@ -4,6 +4,13 @@ Every test drives the real ``examples/repair_chat.py`` as a subprocess
 against an owned loopback HTTP server (``127.0.0.1`` port 0) with purely
 synthetic Codex homes, TOML configs, catalogs and credentials: no real
 profile, no real key, no network beyond the loopback interfaces.
+
+The client's transport is the official OpenAI Python SDK (pinned in the
+``client`` dependency group); the owned server speaks raw HTTP bytes, so
+the SDK's real request serialisation, SSE parser, typed event boundary and
+error mapping are exercised end to end.  The request mode is fixed per run:
+buffered (default, JSON responses) or ``--stream`` (SSE responses, with the
+R3 JSON fallback when the server actually returns JSON).
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CLIENT = REPO_ROOT / "examples" / "repair_chat.py"
 KEY_ENV = "SYN_042_KEY"
 KEY = "synthetic-042-key"
+STREAM_ARGS = ("--stream",)
 
 CATALOG_2 = {
     "models": [
@@ -75,10 +83,11 @@ class Server:
 
     Response specs: ``status``, ``headers`` and ``chunks`` (bytes, or a
     ``("wait", event)`` tuple that holds the stream until the event is
-    set).  HTTP/1.0 close-delimited bodies keep the client's urllib reads
-    simple.  Handler threads are non-daemon; unexpected handler errors
-    (other than client disconnects) are collected and asserted on in
-    :meth:`stop`, so a fixture bug can never masquerade as a pass.
+    set).  HTTP/1.0 close-delimited bodies keep the reads simple for both
+    the SDK transport and the test assertions.  Handler threads are
+    non-daemon; unexpected handler errors (other than client disconnects)
+    are collected and asserted on in :meth:`stop`, so a fixture bug can
+    never masquerase as a pass.
     """
 
     def __init__(self, responses: list[dict[str, Any]] | None = None) -> None:
@@ -259,16 +268,24 @@ def response_obj(
     extension: dict[str, object] | None = None,
     error: object = None,
 ) -> dict[str, object]:
+    # The SDK's typed Response model requires a minimal set of fields; the
+    # fixture supplies them so only the fields under test vary.  Unknown
+    # root fields (the repair extension) survive via the SDK's
+    # extra-fields retention.
     value: dict[str, object] = {
         "id": "resp_1",
         "object": "response",
+        "created_at": 1,
+        "model": "synthetic-model",
         "status": status,
+        "error": error,
         "output": output if output is not None else [],
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
     }
     if extension is not None:
         value["llm_language_repair"] = extension
-    if error is not None:
-        value["error"] = error
     return value
 
 
@@ -307,18 +324,12 @@ def sse_spec(chunks: Sequence[object]) -> dict[str, object]:
     return {
         "status": 200,
         "headers": {"Content-Type": "text/event-stream"},
-        "chunks": chunks,
+        "chunks": list(chunks),
     }
 
 
 def stdout_lines(proc: subprocess.CompletedProcess[str]) -> list[str]:
     return proc.stdout.splitlines()
-
-
-# ---------------------------------------------------------------------------
-# Startup, configuration, profiles, catalog, auth, URL
-# ---------------------------------------------------------------------------
-
 
 def test_help_exits_zero_without_network(tmp_path: Path) -> None:
     proc = run_client(tmp_path / "no-such-home", "", args=("--help",))
@@ -540,7 +551,8 @@ def test_request_shape_and_client_owned_headers(tmp_path: Path) -> None:
     assert req.method == "POST" and req.path == "/v1/responses"
     body = req.json_body
     assert body["model"] == "alpha"
-    assert body["store"] is False and body["stream"] is True
+    # Buffered mode is the default: the SDK request carries stream=False.
+    assert body["store"] is False and body["stream"] is False
     assert body["reasoning"] == {"effort": "low"}
     assert body["input"] == [
         {"role": "user", "content": [{"type": "input_text", "text": "Pozdrav."}]}
@@ -550,6 +562,21 @@ def test_request_shape_and_client_owned_headers(tmp_path: Path) -> None:
     assert req.header("X-LLM-Language-Repair-Details") == "1"
     assert req.header("Authorization") == f"Bearer {KEY}"
     assert (req.header("Content-Type") or "").startswith("application/json")
+    assert "request mode: buffered (completed response)" in proc.stdout
+
+
+def test_stream_flag_requests_streamed_events(tmp_path: Path) -> None:
+    with owned_server(
+        [sse_spec([sse({"type": "response.completed", "response": response_obj(
+            output=[message_output("Odgovor.")])})])]
+    ) as server:
+        home = write_home(tmp_path, config_for(server))
+        proc = run_client(home, "Pozdrav.\n", args=STREAM_ARGS)
+    assert proc.returncode == 0
+    body = server.requests[0].json_body
+    assert body["stream"] is True and body["store"] is False
+    assert "request mode: stream (live events)" in proc.stdout
+    assert "Delivered response" in proc.stdout
 
 
 def test_history_is_delivered_only_across_turns(tmp_path: Path) -> None:
@@ -586,14 +613,20 @@ def test_history_is_delivered_only_across_turns(tmp_path: Path) -> None:
 
 
 def test_noncompleted_terminal_not_committed(tmp_path: Path) -> None:
+    # Both turns run in stream mode: a completed event carrying a
+    # non-completed response must not commit; the following valid turn
+    # starts from only its new prompt.
     held = sse_spec(
-        [sse({"type": "response.completed", "response": response_obj(status="in_progress")})]
+        [sse({"type": "response.completed",
+              "response": response_obj(status="in_progress")})]
     )
-    with owned_server(
-        [held, json_spec(response_obj(output=[message_output("Veljaven.")]))]
-    ) as server:
+    good = sse_spec(
+        [sse({"type": "response.completed",
+              "response": response_obj(output=[message_output("Veljaven.")])})]
+    )
+    with owned_server([held, good]) as server:
         home = write_home(tmp_path, config_for(server))
-        proc = run_client(home, "Neveljaven.\nVeljaven.\n")
+        proc = run_client(home, "Neveljaven.\nVeljaven.\n", args=STREAM_ARGS)
     assert proc.returncode == 0
     assert len(server.requests) == 2
     assert len(server.requests[1].json_body["input"]) == 1
@@ -612,7 +645,11 @@ def test_json_terminal_statuses_rejected(tmp_path: Path) -> None:
             "response incomplete on the endpoint",
         ),
         (
-            response_obj(status="completed", output=[message_output("X")], error={"code": "boom"}),
+            response_obj(
+                status="completed",
+                output=[message_output("X")],
+                error={"code": "boom", "message": "synthetic failure"},
+            ),
             "response failed on the endpoint",
         ),
     )
@@ -628,7 +665,7 @@ def test_json_terminal_statuses_rejected(tmp_path: Path) -> None:
 def test_completed_without_answer_text_not_committed(tmp_path: Path) -> None:
     value = response_obj(
         output=[
-            reasoning_output("r1", content=[{"type": "reasoning_text", "text": "misel"}])
+            reasoning_output("r1", content=[{"type": "reasoning.text", "text": "misel"}])
         ]
     )
     with owned_server([json_spec(value)]) as server:
@@ -639,11 +676,16 @@ def test_completed_without_answer_text_not_committed(tmp_path: Path) -> None:
     assert "Delivered response" not in proc.stdout
 
 
-def test_json_non_object_and_invalid_body_rejected(tmp_path: Path) -> None:
+def test_buffered_non_object_and_invalid_body_rejected(tmp_path: Path) -> None:
+    # Buffered mode: the SDK's typed Response boundary rejects a
+    # non-object JSON body and a non-JSON body with fixed, secret-free
+    # diagnostics instead of a traceback.
     for index, (chunks, expected) in enumerate(
         [
-        ([json.dumps([1, 2]).encode()], "non-object JSON"),
-        ([b"not json at all"], "non-JSON where JSON was expected"),
+            # The SDK returns a non-object JSON body as-is; the client
+            # rejects it with the fixed non-object diagnostic.
+            ([json.dumps([1, 2]).encode()], "non-object JSON"),
+            ([b"not json at all"], "malformed data"),
         ]
     ):
         with owned_server(
@@ -654,6 +696,23 @@ def test_json_non_object_and_invalid_body_rejected(tmp_path: Path) -> None:
         assert expected in proc.stdout, (index, proc.stdout)
         assert "Delivered response" not in proc.stdout
         assert proc.returncode == 0
+        assert "Traceback" not in proc.stderr
+
+
+def test_buffered_invalid_utf8_body_rejected_without_traceback(tmp_path: Path) -> None:
+    # The invalid byte is not valid UTF-8; the owned server sends it in a
+    # JSON content type.  The client must fail with the fixed malformed
+    # diagnostic and return to the prompt, without a traceback.
+    with owned_server(
+        [{"status": 200, "headers": {"Content-Type": "application/json"},
+          "chunks": [b"\xff\xfe not utf-8"]}]
+    ) as server:
+        home = write_home(tmp_path, config_for(server))
+        proc = run_client(home, "Hej.\n")
+    assert proc.returncode == 0
+    assert "malformed data" in proc.stdout
+    assert "Delivered response" not in proc.stdout
+    assert "Traceback" not in proc.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -669,7 +728,7 @@ def test_named_sse_fields_accepted_before_data(tmp_path: Path) -> None:
     ]
     with owned_server([sse_spec(chunks)]) as server:
         home = write_home(tmp_path, config_for(server))
-        proc = run_client(home, "Hej.\n")
+        proc = run_client(home, "Hej.\n", args=STREAM_ARGS)
     assert proc.returncode == 0
     assert "Delivered response" in proc.stdout
     assert "Odgovor." in proc.stdout
@@ -684,7 +743,7 @@ def test_malformed_sse_data_is_honest_failure(tmp_path: Path) -> None:
     ]
     with owned_server([sse_spec(chunks)]) as server:
         home = write_home(tmp_path, config_for(server))
-        proc = run_client(home, "Hej.\nDrugic.\n")
+        proc = run_client(home, "Hej.\nDrugic.\n", args=STREAM_ARGS)
     assert "malformed stream data" in proc.stdout
     assert "Delivered response" not in proc.stdout
     assert "Traceback" not in proc.stderr
@@ -693,7 +752,24 @@ def test_malformed_sse_data_is_honest_failure(tmp_path: Path) -> None:
     assert len(server.requests[1].json_body["input"]) == 1
 
 
+def test_stream_invalid_utf8_is_honest_failure(tmp_path: Path) -> None:
+    # The SDK's SSE decoder decodes lines as UTF-8; an invalid byte is a
+    # stream failure with a fixed diagnostic, not a traceback.
+    chunks = [
+        b"data: {\"type\": \"response.created\",\r\n \xff",
+    ]
+    with owned_server([sse_spec(chunks)]) as server:
+        home = write_home(tmp_path, config_for(server))
+        proc = run_client(home, "Hej.\n", args=STREAM_ARGS)
+    assert proc.returncode == 0
+    assert "invalid UTF-8" in proc.stdout
+    assert "Delivered response" not in proc.stdout
+    assert "Traceback" not in proc.stderr
+
+
 def test_non_object_sse_frame_is_malformed(tmp_path: Path) -> None:
+    # The SDK yields non-object frames as-is; the client detects the
+    # missing string event type and fails honestly.
     chunks = [
         b"data: [1, 2]\r\n\r\n",
         sse({"type": "response.completed", "response": response_obj(
@@ -701,30 +777,32 @@ def test_non_object_sse_frame_is_malformed(tmp_path: Path) -> None:
     ]
     with owned_server([sse_spec(chunks)]) as server:
         home = write_home(tmp_path, config_for(server))
-        proc = run_client(home, "Hej.\n")
-    assert "malformed stream event" in proc.stdout
+        proc = run_client(home, "Hej.\n", args=STREAM_ARGS)
+    assert "malformed stream data" in proc.stdout
     assert "Delivered response" not in proc.stdout
 
 
-def test_line_without_field_is_malformed(tmp_path: Path) -> None:
+def test_line_without_field_ends_stream_without_terminal(tmp_path: Path) -> None:
+    # The SDK's spec-compliant decoder ignores a line that forms no SSE
+    # field, so a frame-less stream simply never reaches a terminal event.
     with owned_server([sse_spec([b"garbageline\r\n\r\n"])]) as server:
         home = write_home(tmp_path, config_for(server))
-        proc = run_client(home, "Hej.\n")
-    assert "malformed stream data" in proc.stdout
+        proc = run_client(home, "Hej.\n", args=STREAM_ARGS)
+    assert "stream ended before completion" in proc.stdout
     assert "Delivered response" not in proc.stdout
     assert "Traceback" not in proc.stderr
 
 
 def test_unknown_wellformed_event_types_ignored(tmp_path: Path) -> None:
     chunks = [
-        sse({"type": "response.created", "response": {"id": "r"}}),
+        sse({"type": "response.created", "response": response_obj()}),
         sse({"type": "response.synthetic_marker", "value": 1}),
         sse({"type": "response.completed", "response": response_obj(
             output=[message_output("Odgovor.")])}),
     ]
     with owned_server([sse_spec(chunks)]) as server:
         home = write_home(tmp_path, config_for(server))
-        proc = run_client(home, "Hej.\n")
+        proc = run_client(home, "Hej.\n", args=STREAM_ARGS)
     assert proc.returncode == 0
     assert "Delivered response" in proc.stdout
     assert "Odgovor." in proc.stdout
@@ -737,7 +815,7 @@ def test_premature_eof_is_not_success(tmp_path: Path) -> None:
     ]
     with owned_server([sse_spec(chunks)]) as server:
         home = write_home(tmp_path, config_for(server))
-        proc = run_client(home, "Hej.\n")
+        proc = run_client(home, "Hej.\n", args=STREAM_ARGS)
     assert "stream ended before completion" in proc.stdout
     assert "Delivered response" not in proc.stdout
     assert proc.returncode == 0
@@ -749,19 +827,42 @@ def test_response_failed_and_incomplete_events(tmp_path: Path) -> None:
          ("response.incomplete", "response incomplete on the endpoint")]
     ):
         with owned_server(
-            [sse_spec([sse({"type": event_type, "response": {"id": "r"}})])]
+            [sse_spec([sse({"type": event_type, "response": response_obj()})])]
         ) as server:
             home = write_home(tmp_path / str(index), config_for(server))
-            proc = run_client(home, "Hej.\n")
+            proc = run_client(home, "Hej.\n", args=STREAM_ARGS)
         assert expected in proc.stdout
         assert "Delivered response" not in proc.stdout
 
 
+def test_known_stream_failure_code_is_fixed_diagnostic(tmp_path: Path) -> None:
+    # The closed-set gateway code becomes a fixed, content-free diagnostic;
+    # the server-provided message (carrying a synthetic credential) is never
+    # echoed.
+    failed = response_obj(
+        status="failed",
+        error={"code": "responses_stream_event_not_supported", "message": KEY},
+    )
+    chunks = [
+        sse({"type": "response.created", "response": response_obj()}),
+        sse({"type": "response.failed", "response": failed}),
+    ]
+    with owned_server([sse_spec(chunks)]) as server:
+        home = write_home(tmp_path, config_for(server))
+        proc = run_client(home, "Hej.\n", args=STREAM_ARGS)
+    assert proc.returncode == 0
+    assert "responses_stream_event_not_supported" in proc.stdout
+    assert "without --stream" in proc.stdout
+    assert KEY not in proc.stdout + proc.stderr
+    assert "Delivered response" not in proc.stdout
+
+
 def test_error_event_payload_never_echoed(tmp_path: Path) -> None:
-    secret_event = sse({"type": "error", "error": {"code": KEY, "message": KEY}})
+    secret_event = sse({"type": "error", "code": KEY, "message": KEY,
+                        "sequence_number": 0})
     with owned_server([sse_spec([secret_event])]) as server:
         home = write_home(tmp_path, config_for(server))
-        proc = run_client(home, "Hej.\n")
+        proc = run_client(home, "Hej.\n", args=STREAM_ARGS)
     assert "the endpoint reported an error" in proc.stdout
     assert KEY not in proc.stdout + proc.stderr
     assert "Delivered response" not in proc.stdout
@@ -804,7 +905,7 @@ def test_timeout_mid_stream_returns_to_prompt(tmp_path: Path) -> None:
     with owned_server([sse_spec(chunks)]) as server:
         home = write_home(tmp_path, config_for(server))
         try:
-            proc = run_client(home, "Hej.\n/quit\n", args=("--timeout", "1"))
+            proc = run_client(home, "Hej.\n/quit\n", args=STREAM_ARGS + ("--timeout", "1"))
         finally:
             hold.set()
     assert proc.returncode == 0
@@ -812,8 +913,127 @@ def test_timeout_mid_stream_returns_to_prompt(tmp_path: Path) -> None:
     assert "Delivered response" not in proc.stdout
 
 
+def test_stream_json_fallback_read_timeout_returns_to_prompt(tmp_path: Path) -> None:
+    # --stream receives a JSON content type and the body is held: the
+    # owned response read must surface the finite timeout as a fixed
+    # diagnostic (no traceback, back at the prompt), not an uncaught
+    # transport exception.
+    hold = threading.Event()
+    spec = {
+        "status": 200,
+        "headers": {"Content-Type": "application/json"},
+        "chunks": [b'{"partial": ', ("wait", hold)],
+    }
+    with owned_server([spec]) as server:
+        home = write_home(tmp_path, config_for(server))
+        try:
+            proc = run_client(home, "Hej.\n/quit\n", args=STREAM_ARGS + ("--timeout", "0.3"))
+        finally:
+            hold.set()
+    assert proc.returncode == 0
+    assert "request timed out after 0.3 seconds" in proc.stdout
+    assert "Delivered response" not in proc.stdout
+    assert "Traceback" not in proc.stderr
 # ---------------------------------------------------------------------------
-# Reasoning display: contiguous streaming, dedup, JSON fallback
+# R3 JSON fallback (stream request, JSON reply) and SDK typed boundary
+# ---------------------------------------------------------------------------
+
+
+def test_stream_mode_json_fallback_delivers(tmp_path: Path) -> None:
+    # --stream with a server that actually answers application/json: the
+    # same single request is parsed through the SDK's typed Response model
+    # and commits exactly like the buffered path (R3 honest JSON fallback).
+    value = response_obj(
+        output=[
+            reasoning_output("r1", summary=[{"type": "summary_text", "text": "misel"}]),
+            message_output("Odgovor."),
+        ],
+        extension={
+            "version": 1,
+            "status": "complete",
+            "output_index": 1,
+            "content_index": 0,
+            "original_text": "Izvirnik.",
+        },
+    )
+    with owned_server([json_spec(value)]) as server:
+        home = write_home(tmp_path, config_for(server))
+        proc = run_client(home, "Hej.\n", args=STREAM_ARGS)
+    assert proc.returncode == 0
+    assert server.requests[0].json_body["stream"] is True
+    assert "Delivered response" in proc.stdout
+    assert "Odgovor." in proc.stdout
+    assert "Izvirnik." in proc.stdout
+    assert "misel" in proc.stdout
+    assert "Original response was not provided." not in proc.stdout
+
+
+def test_stream_mode_mixed_sse_then_json_turns(tmp_path: Path) -> None:
+    # One run, two turns, stream mode: the first reply is SSE and the
+    # second is JSON (as the gateway may answer either way per request).
+    # Both must commit, and the second request carries the delivered-only
+    # history of the first.
+    sse_turn = sse_spec(
+        [sse({"type": "response.completed",
+              "response": response_obj(output=[message_output("Prvi.")])})]
+    )
+    json_turn = json_spec(response_obj(output=[message_output("Drugi.")]))
+    with owned_server([sse_turn, json_turn]) as server:
+        home = write_home(tmp_path, config_for(server))
+        proc = run_client(home, "Prvi.\nDrugi.\n", args=STREAM_ARGS)
+    assert proc.returncode == 0
+    assert proc.stdout.count("Delivered response") == 2
+    assert "Prvi." in proc.stdout and "Drugi." in proc.stdout
+    second_input = server.requests[1].json_body["input"]
+    assert second_input == [
+        {"role": "user", "content": [{"type": "input_text", "text": "Prvi."}]},
+        {"role": "assistant", "content": [{"type": "input_text", "text": "Prvi."}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "Drugi."}]},
+    ]
+
+
+def test_unknown_terminal_namespace_preserved_and_ignored(tmp_path: Path) -> None:
+    # The SDK preserves an unknown output-item namespace on its typed
+    # model (it does not reject the whole response).  The client's
+    # answer contract is unaffected: the valid message item is the only
+    # answer material, the nested look-alike original of the unknown item
+    # is never printed, and the fixed missing-original line is shown
+    # because the root extension is absent.
+    value = response_obj(
+        output=[
+            {"type": "llm_language_repair", "id": "x", "original_text": "Ne sme."},
+            message_output("Odgovor."),
+        ]
+    )
+    with owned_server([json_spec(value)]) as server:
+        home = write_home(tmp_path, config_for(server))
+        proc = run_client(home, "Hej.\n")
+    assert proc.returncode == 0
+    assert "Delivered response" in proc.stdout
+    assert "Odgovor." in proc.stdout
+    assert "Ne sme." not in proc.stdout
+    assert "Original response was not provided." in proc.stdout
+    assert "Traceback" not in proc.stderr
+
+
+def test_startup_shows_selected_mode(tmp_path: Path) -> None:
+    with owned_server(
+        [json_spec(response_obj(output=[message_output("A")]))]
+    ) as server:
+        home = write_home(tmp_path, config_for(server))
+        buffered = run_client(home, "/quit\n")
+    assert "request mode: buffered (completed response)" in buffered.stdout
+    with owned_server(
+        [sse_spec([sse({"type": "response.completed",
+                        "response": response_obj(output=[message_output("B")])})])]
+    ) as server:
+        home = write_home(tmp_path, config_for(server))
+        streamed = run_client(home, "/quit\n", args=STREAM_ARGS)
+    assert "request mode: stream (live events)" in streamed.stdout
+
+
+# ---------------------------------------------------------------------------
+# Reasoning display: contiguous streaming, dedup, buffered rendering
 # ---------------------------------------------------------------------------
 
 
@@ -823,7 +1043,7 @@ def test_streamed_thinking_contiguous_and_not_repeated(tmp_path: Path) -> None:
         output=[
             reasoning_output(
                 "rs_1",
-                content=[{"type": "reasoning_text", "text": thinking}],
+                content=[{"type": "reasoning.text", "text": thinking}],
                 summary=[],
             ),
             message_output("Odgovor."),
@@ -840,7 +1060,7 @@ def test_streamed_thinking_contiguous_and_not_repeated(tmp_path: Path) -> None:
     ]
     with owned_server([sse_spec(chunks)]) as server:
         home = write_home(tmp_path, config_for(server))
-        proc = run_client(home, "Hej.\n")
+        proc = run_client(home, "Hej.\n", args=STREAM_ARGS)
     assert proc.returncode == 0
     assert thinking in proc.stdout
     assert proc.stdout.count(thinking) == 1
@@ -852,7 +1072,7 @@ def test_done_only_reasoning_printed_once(tmp_path: Path) -> None:
     text = "Celotna razmislitev."
     final = response_obj(
         output=[
-            reasoning_output("rs_2", content=[{"type": "reasoning_text", "text": text}]),
+            reasoning_output("rs_2", content=[{"type": "reasoning.text", "text": text}]),
             message_output("Odgovor."),
         ]
     )
@@ -863,7 +1083,7 @@ def test_done_only_reasoning_printed_once(tmp_path: Path) -> None:
     ]
     with owned_server([sse_spec(chunks)]) as server:
         home = write_home(tmp_path, config_for(server))
-        proc = run_client(home, "Hej.\n")
+        proc = run_client(home, "Hej.\n", args=STREAM_ARGS)
     assert proc.returncode == 0
     assert proc.stdout.count(text) == 1
 
@@ -872,7 +1092,7 @@ def test_terminal_item_only_reasoning_not_dropped(tmp_path: Path) -> None:
     text = "Samostojna razmislitev."
     final = response_obj(
         output=[
-            reasoning_output("r9", content=[{"type": "reasoning_text", "text": text}]),
+            reasoning_output("r9", content=[{"type": "reasoning.text", "text": text}]),
             message_output("Odgovor."),
         ]
     )
@@ -880,10 +1100,36 @@ def test_terminal_item_only_reasoning_not_dropped(tmp_path: Path) -> None:
         [sse_spec([sse({"type": "response.completed", "response": final})])]
     ) as server:
         home = write_home(tmp_path, config_for(server))
-        proc = run_client(home, "Hej.\n")
+        proc = run_client(home, "Hej.\n", args=STREAM_ARGS)
     assert proc.returncode == 0
     assert proc.stdout.count(text) == 1
     assert "Thinking" in proc.stdout
+
+
+def test_buffered_reasoning_shown_with_answer(tmp_path: Path) -> None:
+    # Buffered mode: the completed response carries the reasoning item;
+    # its parts are shown once, before the delivered answer.
+    raw = "Izvirna razmislitev."
+    summary = "Povzetek razmislega."
+    value = response_obj(
+        output=[
+            reasoning_output(
+                "r1",
+                content=[{"type": "reasoning.text", "text": raw}],
+                summary=[{"type": "summary_text", "text": summary}],
+            ),
+            message_output("Odgovor."),
+        ]
+    )
+    with owned_server([json_spec(value)]) as server:
+        home = write_home(tmp_path, config_for(server))
+        proc = run_client(home, "Hej.\n")
+    assert proc.returncode == 0
+    assert proc.stdout.count(raw) == 1
+    assert proc.stdout.count(summary) == 1
+    assert "Thinking" in proc.stdout
+    assert "Thinking summary" in proc.stdout
+    assert "Delivered response" in proc.stdout
 
 
 def test_output_item_done_event_only_reasoning(tmp_path: Path) -> None:
@@ -891,7 +1137,7 @@ def test_output_item_done_event_only_reasoning(tmp_path: Path) -> None:
     summary_text = "Vidni povzetek iz item.done."
     done_item = reasoning_output(
         "r1",
-        content=[{"type": "reasoning_text", "text": raw_text}],
+        content=[{"type": "reasoning.text", "text": raw_text}],
         summary=[{"type": "summary_text", "text": summary_text}],
     )
     # The terminal snapshot repeats the same reasoning item without the
@@ -910,7 +1156,7 @@ def test_output_item_done_event_only_reasoning(tmp_path: Path) -> None:
     ]
     with owned_server([sse_spec(chunks)]) as server:
         home = write_home(tmp_path, config_for(server))
-        proc = run_client(home, "Hej.\n")
+        proc = run_client(home, "Hej.\n", args=STREAM_ARGS)
     assert proc.returncode == 0
     assert proc.stdout.count(raw_text) == 1
     assert proc.stdout.count(summary_text) == 1
@@ -937,8 +1183,6 @@ def test_json_summary_only_is_displayed_as_summary(tmp_path: Path) -> None:
     assert "Thinking summary" in proc.stdout
     assert "Thinking" not in lines
     assert any(line.endswith("Thinking summary") for line in lines)
-
-
 def test_extension_unavailable_with_list_reason_does_not_crash(tmp_path: Path) -> None:
     value = response_obj(
         output=[message_output("Odgovor.")],
@@ -1076,14 +1320,14 @@ def test_unexpected_fixture_errors_are_collected_not_masked(tmp_path: Path) -> N
     server.start()
     try:
         home = write_home(tmp_path, config_for(server))
-        proc = run_client(home, "Hej.\n")
+        proc = run_client(home, "Hej.\n", args=STREAM_ARGS)
         assert proc.returncode == 0
+        assert "stream ended before completion" in proc.stdout
         assert "Delivered response" not in proc.stdout
     finally:
         server.release()
     assert server.handler_errors, "unexpected handler error was not collected"
     assert any("TypeError" in error for error in server.handler_errors)
-
 
 def test_model_menu_selects_on_next_line(tmp_path: Path) -> None:
     with owned_server(
@@ -1294,6 +1538,7 @@ class Pump:
         return returncode, bytes(self.buf), stderr
 
 
+
 def test_held_final_barrier_thinking_flushed_then_original(tmp_path: Path) -> None:
     thinking = "Preverjam slovenski stavek."
     original = "Lep sončn dan 😀."
@@ -1302,7 +1547,7 @@ def test_held_final_barrier_thinking_flushed_then_original(tmp_path: Path) -> No
         output=[
             reasoning_output(
                 "rs_1",
-                content=[{"type": "reasoning_text", "text": thinking}],
+                content=[{"type": "reasoning.text", "text": thinking}],
                 summary=[],
             ),
             message_output(delivered),
@@ -1332,7 +1577,7 @@ def test_held_final_barrier_thinking_flushed_then_original(tmp_path: Path) -> No
     ]
     with owned_server([sse_spec(chunks)]) as server:
         home = write_home(tmp_path, config_for(server), models=json.dumps(CATALOG_2))
-        pump = Pump(home)
+        pump = Pump(home, args=STREAM_ARGS)
         try:
             pump.write("/model\n2\n/thinking\n1\nPopravi opis vremena.\n")
             assert pump.wait_for(thinking.encode("utf-8"), 8), bytes(pump.buf)
@@ -1361,7 +1606,7 @@ def test_sigint_during_request_returns_prompt_and_quits(tmp_path: Path) -> None:
     hold = threading.Event()
     with owned_server([sse_spec([("wait", hold)])]) as server:
         home = write_home(tmp_path, config_for(server))
-        pump = Pump(home)
+        pump = Pump(home, args=STREAM_ARGS)
         try:
             pump.write("Hej.\n")
             assert pump.wait_for(b"you> ", 5)

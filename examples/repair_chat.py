@@ -3,17 +3,25 @@
 
 Loads Codex-style TOML configuration (``config.toml`` plus either a
 ``[profiles.NAME]`` table or a standalone ``NAME.config.toml``) and a model
-catalog, then runs a simple text-only chat loop that POSTs to
-``/v1/responses`` through the configured gateway/proxy.  Server-provided
-thinking is printed immediately into ordinary terminal scrollback; the
+catalog, then runs a simple text-only chat loop that calls the
+``/v1/responses`` endpoint through the configured gateway/proxy.
+Server-provided thinking is printed into ordinary terminal scrollback; the
 authoritative delivered answer and, when actually returned, the original
 answer are printed once the response completes.
 
-Standard library only: no new SDK/package is required.  The client never
-starts an AI process, never reads ``auth.json`` or performs OAuth, never
-prints credentials, never retries, keeps no on-disk transcript and performs
-no terminal screen manipulation (no ANSI cursor movement, alternate screen,
-clearing or spinners).
+Transport: the official OpenAI Python SDK (pinned ``openai==3.60.0``,
+Responses API) is the actual request and event boundary; install it from
+the pinned ``client`` dependency group (see examples/README.md).  The
+request mode is fixed at startup: buffered (the default) sends one request
+and displays the completed response, while ``--stream`` requests streamed
+Responses events and prints server reasoning deltas as they arrive.
+Retries are disabled (``max_retries=0``), every request uses a finite
+timeout and deterministic cleanup, redirects are refused, and the client
+never prints credentials, raw server messages or request/response bodies.
+The client never starts an AI process, never reads ``auth.json`` or
+performs OAuth, keeps no on-disk transcript and performs no terminal
+screen manipulation (no ANSI cursor movement, alternate screen, clearing
+or spinners).
 
 Deterministic configuration precedence (documented in examples/README.md):
 
@@ -41,18 +49,29 @@ Deterministic configuration precedence (documented in examples/README.md):
 from __future__ import annotations
 
 import argparse
-import http.client
 import json
 import math
 import os
 import sys
 import tomllib
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Any, NoReturn
+from typing import Any, NoReturn
+
+import httpx2
+from openai import (
+    APIConnectionError,
+    APIError,
+    APIResponseValidationError,
+    APIStatusError,
+    APITimeoutError,
+    DefaultHttpxClient,
+    OpenAI,
+    OpenAIError,
+)
+from openai.types.responses import Response, ResponseOutputMessage, ResponseOutputText
+from pydantic import ValidationError as PydanticValidationError
 
 REPAIR_DETAILS_HEADER = "X-LLM-Language-Repair-Details"
 MISSING_ORIGINAL_MESSAGE = "Original response was not provided."
@@ -60,6 +79,10 @@ CONVENTIONAL_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high")
 FIXED_UNAVAILABLE_REASONS = frozenset(
     {"EDIT_MAPPING_UNAVAILABLE", "DETAILS_TOO_LARGE", "UPSTREAM_FIELD_COLLISION"}
 )
+# Closed set of machine error codes the client recognises.  Only these may
+# surface verbatim; every other server code, message, header and body stays
+# out of the terminal output.
+KNOWN_ENDPOINT_FAILURE_CODES = frozenset({"responses_stream_event_not_supported"})
 HEADER_TOKEN_CHARS = frozenset("!#$%&'*+-.^_`|~")
 CLIENT_OWNED_HEADERS = frozenset(
     {"authorization", "content-type", REPAIR_DETAILS_HEADER.lower()}
@@ -77,6 +100,8 @@ Commands (one per line):
 Any other line is sent as one user message.  Menus accept a number or the
 name itself; blank or 0 cancels; an invalid selection leaves the current
 choice unchanged.  Menus and slash commands make zero API calls.
+Request mode (buffered by default, --stream for live events) is fixed at
+startup.
 """
 
 _MENU_CANCELLED = "cancelled"
@@ -89,7 +114,6 @@ class ClientError(Exception):
 
 def _fail(message: str) -> NoReturn:
     raise ClientError(message)
-
 
 @dataclass(frozen=True)
 class CatalogModel:
@@ -289,6 +313,12 @@ def resolve_token(provider: Provider) -> str:
 
 
 def build_url(base: str | None, override: str | None) -> str:
+    """Validate and normalize the API base URL.
+
+    The official SDK appends exactly one ``/responses`` path segment to the
+    returned base, so a base that already ends with ``/responses`` is
+    rejected instead of producing a doubled path.
+    """
     chosen = override if override is not None else base
     if not chosen:
         _fail(
@@ -311,9 +341,10 @@ def build_url(base: str | None, override: str | None) -> str:
     if path.endswith("/responses"):
         _fail(
             "the API base URL must not already end with /responses; "
-            "it is appended exactly once"
+            "the SDK appends it exactly once"
         )
-    return f"{parts.scheme}://{parts.netloc}{path}/responses"
+    return f"{parts.scheme}://{parts.netloc}{path}"
+
 
 
 def _catalog_entry(entry: Any, context: str) -> CatalogModel:
@@ -571,7 +602,6 @@ def _assistant_message(text: str) -> dict[str, Any]:
     # messages with input_text parts for both roles.
     return {"role": "assistant", "content": [{"type": "input_text", "text": text}]}
 
-
 @dataclass
 class _ReasoningChannel:
     """Stream state of one reasoning channel (raw or summary): deltas of
@@ -588,24 +618,24 @@ class _ReasoningChannel:
 class _TurnState:
     raw: _ReasoningChannel = field(default_factory=_ReasoningChannel)
     summary: _ReasoningChannel = field(default_factory=_ReasoningChannel)
-    completed: dict[str, Any] | None = None
+    completed: Response | None = None
     failed: bool = False
+    failed_error_code: str | None = None
     incomplete: bool = False
     server_error: bool = False
 
 
-def _part_key(obj: dict[str, Any], summary: bool) -> str | None:
-    """Stable per-part identity used to show each reasoning part at most
-    once across streamed deltas, done events and the terminal output.
-    Parts without an item id fall back to channel-level dedup only."""
-    item_id = obj.get("item_id")
+def _event_part_key(event: Any, index_name: str) -> str | None:
+    """Stable per-part identity of one streamed reasoning delta/done
+    event, used to show each reasoning part at most once across streamed
+    deltas, done events and the terminal output.  Events without an item
+    id fall back to channel-level dedup only."""
+    item_id = getattr(event, "item_id", None)
     if type(item_id) is not str or not item_id:
         return None
-    names = ("summary_index", "content_index") if summary else ("content_index",)
-    for name in names:
-        index = obj.get(name)
-        if type(index) is int and not isinstance(index, bool):
-            return f"{item_id}:{index}"
+    index = getattr(event, index_name, None)
+    if type(index) is int and not isinstance(index, bool):
+        return f"{item_id}:{index}"
     return item_id
 
 
@@ -648,7 +678,7 @@ def _emit_reasoning_terminal(
 ) -> None:
     """Print one complete reasoning part (done event or terminal output).
     A part that was already streamed is not repeated; an unstreamed part
-    (item-only, JSON fallback) is shown once on its own line."""
+    (item-only, buffered response) is shown once on its own line."""
     channel = _channel(state, kind)
     if key is not None:
         if key in channel.done:
@@ -671,30 +701,59 @@ def _emit_reasoning_terminal(
         channel.done.add(key)
 
 
-def _emit_reasoning_item(state: _TurnState, item: dict[str, Any]) -> None:
+def _typed_part_texts(parts: Any) -> list[str]:
+    """Texts of the typed reasoning parts that actually carry a ``text``
+    field (``reasoning.text`` content parts and ``summary_text`` summary
+    parts); non-text parts such as encrypted content are skipped."""
+    if not isinstance(parts, (list, tuple)):
+        return []
+    texts: list[str] = []
+    for part in parts:
+        text = getattr(part, "text", None)
+        if type(text) is str:
+            texts.append(text)
+    return texts
+
+
+def _emit_reasoning_item(state: _TurnState, item: Any) -> None:
     """Render one reasoning item's parts through the shared per-part dedup
     path, whether it arrived as an output_item.done event or as part of
     the terminal response output."""
-    item_id = item.get("id")
+    item_id = getattr(item, "id", None)
     prefix = item_id if type(item_id) is str and item_id else None
-    for index, text in enumerate(_reasoning_part_texts(item.get("content"))):
+    for index, text in enumerate(_typed_part_texts(getattr(item, "content", None))):
         if text:
             _emit_reasoning_terminal(state, "raw", text, f"{prefix}:{index}" if prefix else None)
-    for index, text in enumerate(_reasoning_part_texts(item.get("summary"))):
+    for index, text in enumerate(_typed_part_texts(getattr(item, "summary", None))):
         if text:
             _emit_reasoning_terminal(
                 state, "summary", text, f"{prefix}:{index}" if prefix else None
             )
 
 
+def _is_reasoning_item(item: Any) -> bool:
+    return item is not None and getattr(item, "type", None) == "reasoning"
+
+
+def _response_error_code(response: Any) -> str | None:
+    """The machine code of a terminal error, when it is a plain string.
+    Free-form error text is never rendered; only codes from the closed
+    known set become a recognized diagnostic."""
+    error = getattr(response, "error", None)
+    if error is None:
+        return None
+    code = getattr(error, "code", None)
+    return code if type(code) is str and code else None
+
+
 def _validate_terminal(response: Any, state: _TurnState) -> None:
     """Only an explicitly successful completion carrying no error may
     commit.  Queued, in-progress, missing, mismatched or errored terminals
     never do."""
-    if not isinstance(response, dict) or response.get("error") is not None:
+    if not isinstance(response, Response) or response.error is not None:
         state.failed = True
         return
-    status = response.get("status")
+    status = response.status
     if type(status) is str and status == "completed":
         state.completed = response
     elif type(status) is str and status == "incomplete":
@@ -703,37 +762,44 @@ def _validate_terminal(response: Any, state: _TurnState) -> None:
         state.failed = True
 
 
-def _handle_event(obj: Any, state: _TurnState) -> None:
-    if not isinstance(obj, dict):
-        _fail("malformed stream event; nothing was committed")
-    etype = obj.get("type")
+def _handle_sdk_event(event: Any, state: _TurnState) -> None:
+    """Dispatch one SDK-parsed stream event.  Frames the SDK parsed but
+    that carry no string event type are malformed stream data; event
+    types the client does not render (created, queued, in-progress,
+    output-text deltas, unknown names) are accepted and ignored."""
+    etype = getattr(event, "type", None)
+    if type(etype) is not str:
+        _fail("malformed stream data; nothing was committed")
     if etype == "response.reasoning_text.delta":
-        delta = obj.get("delta")
+        delta = getattr(event, "delta", None)
         if type(delta) is str and delta:
-            _emit_reasoning_delta(state, "raw", delta, _part_key(obj, False))
+            _emit_reasoning_delta(state, "raw", delta, _event_part_key(event, "content_index"))
     elif etype == "response.reasoning_summary_text.delta":
-        delta = obj.get("delta")
+        delta = getattr(event, "delta", None)
         if type(delta) is str and delta:
-            _emit_reasoning_delta(state, "summary", delta, _part_key(obj, True))
+            _emit_reasoning_delta(state, "summary", delta, _event_part_key(event, "summary_index"))
     elif etype == "response.reasoning_text.done":
-        text = obj.get("text")
+        text = getattr(event, "text", None)
         if type(text) is str and text:
-            _emit_reasoning_terminal(state, "raw", text, _part_key(obj, False))
+            _emit_reasoning_terminal(state, "raw", text, _event_part_key(event, "content_index"))
     elif etype == "response.reasoning_summary_text.done":
-        text = obj.get("text")
+        text = getattr(event, "text", None)
         if type(text) is str and text:
-            _emit_reasoning_terminal(state, "summary", text, _part_key(obj, True))
-    elif etype == "response.completed":
-        _validate_terminal(obj.get("response"), state)
+            _emit_reasoning_terminal(
+                state, "summary", text, _event_part_key(event, "summary_index")
+            )
     elif etype == "response.output_item.done":
         # A reasoning item may arrive as a done event without deltas and
         # before the terminal snapshot repeats it.  Message items are NOT
         # answer material: only the completed response output is.
-        item = obj.get("item")
-        if isinstance(item, dict) and item.get("type") == "reasoning":
+        item = getattr(event, "item", None)
+        if _is_reasoning_item(item):
             _emit_reasoning_item(state, item)
+    elif etype == "response.completed":
+        _validate_terminal(getattr(event, "response", None), state)
     elif etype == "response.failed":
         state.failed = True
+        state.failed_error_code = _response_error_code(getattr(event, "response", None))
     elif etype == "response.incomplete":
         state.incomplete = True
     elif etype == "error":
@@ -743,62 +809,45 @@ def _handle_event(obj: Any, state: _TurnState) -> None:
 
 
 def _extract_delivered(
-    response: dict[str, Any],
+    response: Response,
 ) -> tuple[str | None, int | None, int | None]:
-    output = response.get("output")
+    output = response.output
     if not isinstance(output, list):
         return None, None, None
     for out_index, item in enumerate(output):
-        if not isinstance(item, dict) or item.get("type") != "message":
+        if not isinstance(item, ResponseOutputMessage) or item.type != "message":
             continue
-        role = item.get("role")
+        role = item.role
         if role is not None and role != "assistant":
             continue
-        content = item.get("content")
+        content = item.content
         if not isinstance(content, list):
             continue
         for content_index, part in enumerate(content):
             if (
-                isinstance(part, dict)
-                and part.get("type") == "output_text"
-                and type(part.get("text")) is str
+                isinstance(part, ResponseOutputText)
+                and part.type == "output_text"
+                and type(part.text) is str
             ):
-                return str(part["text"]), out_index, content_index
+                return part.text, out_index, content_index
     return None, None, None
 
 
-def _terminal_reasoning_items(response: dict[str, Any]) -> list[dict[str, Any]]:
-    """Reasoning items of the terminal response, in output order.  Used for
-    the JSON-fallback path and to complete streamed reasoning once per
+def _terminal_reasoning_items(response: Response) -> list[Any]:
+    """Reasoning items of the terminal response, in output order.  Used
+    for the buffered path and to complete streamed reasoning once per
     part; summary text lives in the item's ``summary`` parts, raw text in
     its ``content`` parts."""
-    output = response.get("output")
-    if not isinstance(output, list):
-        return []
-    return [
-        item for item in output if isinstance(item, dict) and item.get("type") == "reasoning"
-    ]
+    return [item for item in response.output if _is_reasoning_item(item)]
 
-
-def _reasoning_part_texts(parts: Any) -> list[str]:
-    if not isinstance(parts, list):
-        return []
-    return [
-        str(part["text"])
-        for part in parts
-        if isinstance(part, dict) and type(part.get("text")) is str
-    ]
 
 
 def _extract_original(
-    response: dict[str, Any], out_index: int, content_index: int
+    ext: dict[str, Any], out_index: int, content_index: int
 ) -> tuple[str | None, str | None]:
     """Return (original_text, fixed_reason) from the ROOT
     llm_language_repair field only - no recursive search of same-named user
     data.  Index values must be real ints bound to the delivered part."""
-    ext = response.get("llm_language_repair")
-    if not isinstance(ext, dict):
-        return None, None
     # Every extension value is untrusted; strict type checks keep invalid
     # shapes (bool versions, non-string statuses, list reasons, ...) on the
     # missing-original path instead of a crash.
@@ -858,7 +907,7 @@ def _edit_summary(ext: dict[str, Any]) -> str | None:
 
 
 def _finish_turn(
-    response: dict[str, Any],
+    response: Response,
     session: Session,
     user_text: str,
     state: _TurnState,
@@ -875,9 +924,12 @@ def _finish_turn(
     print(render_visible(delivered), flush=True)
     original: str | None = None
     fixed_reason: str | None = None
-    ext = response.get("llm_language_repair")
+    # Unknown root-level fields (including the repair extension) survive
+    # SDK parsing in model_extra; the value itself is still untrusted.
+    extra = response.model_extra
+    ext = extra.get("llm_language_repair") if isinstance(extra, dict) else None
     if isinstance(ext, dict):
-        original, fixed_reason = _extract_original(response, out_index, content_index)
+        original, fixed_reason = _extract_original(ext, out_index, content_index)
     if original is not None:
         print("Original response")
         print(render_visible(original), flush=True)
@@ -892,109 +944,110 @@ def _finish_turn(
     session.history.append(_assistant_message(delivered))
 
 
-def _consume_sse(response: Any, state: _TurnState, timeout: float) -> None:
-    frame: list[str] = []
-
-    def dispatch() -> None:
-        if not frame:
-            return
-        joined = "\n".join(frame)
-        del frame[:]
-        if joined.strip() == "[DONE]":
-            return
-        try:
-            obj = json.loads(joined)
-        except ValueError:
-            # Malformed data is an honest stream failure, not an ignorable
-            # frame; unknown well-formed event types are still ignored.
-            _fail("malformed stream data; nothing was committed")
-        _handle_event(obj, state)
-
-    try:
-        while True:
-            raw_line = response.readline()
-            if not raw_line:
-                break
-            line = raw_line.decode("utf-8").rstrip("\r\n")
-            if line == "":
-                dispatch()
-                continue
-            if line.startswith(":"):
-                continue
-            if ":" not in line:
-                _fail("malformed stream data; nothing was committed")
-            if line.startswith("data:"):
-                frame.append(line[5:].lstrip(" "))
-            # Standard SSE fields (event, id, retry) and well-formed
-            # unknown fields are accepted and ignored here: no reconnect,
-            # Last-Event-Id, retry or extra API call behaviour is wanted.
-            continue
-        dispatch()
-    except UnicodeDecodeError:
-        _fail("stream ended with invalid UTF-8; nothing was committed")
-    except TimeoutError:
-        _fail(f"request timed out after {timeout:g} seconds; nothing was committed")
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Refuse every redirect.  The bearer token and the conversation context
-    must never be resent to a different origin, so a redirect response
-    surfaces as a plain HTTP error instead of a new request."""
-
-    def redirect_request(
-        self,
-        req: urllib.request.Request,
-        fp: IO[bytes],
-        code: int,
-        msg: str,
-        headers: http.client.HTTPMessage,
-        newurl: str,
-    ) -> urllib.request.Request | None:
-        return None
-
-
-def send_once(session: Session, resolved: Resolved, user_text: str) -> None:
-    body: dict[str, Any] = {
+def _request_kwargs(
+    session: Session, user_text: str, headers: dict[str, str], *, stream: bool
+) -> dict[str, Any]:
+    """The exact request: one main call per prompt, the delivered-only
+    history, store disabled, the selected reasoning effort, and the
+    client-owned details header.  No tools, conversation, metadata or
+    retry semantics are added."""
+    kwargs: dict[str, Any] = {
         "model": session.wire_model(),
         "input": [*session.history, _user_message(user_text)],
         "store": False,
-        "stream": True,
+        "stream": stream,
+        "extra_headers": dict(headers),
     }
     if session.effort is not None:
-        body["reasoning"] = {"effort": session.effort}
-    payload = json.dumps(body).encode("utf-8")
+        kwargs["reasoning"] = {"effort": session.effort}
+    return kwargs
+
+
+def _consume_sdk_json_fallback(stream_obj: Any, state: _TurnState) -> None:
+    """R3 JSON fallback: when the server actually returns JSON for this
+    request, read the body once and parse it with the SDK's own typed
+    ``Response`` model.  Same single request; no retry, no mode fallback,
+    and the terminal is still validated exactly like the buffered path."""
+    raw = stream_obj.response.read()
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        _fail("endpoint returned malformed data; nothing was committed")
+    if not isinstance(data, dict):
+        _fail("endpoint returned non-object JSON; nothing was committed")
+    try:
+        response = Response.model_validate(data)
+    except PydanticValidationError:
+        _fail("endpoint returned data the SDK could not parse; nothing was committed")
+    _validate_terminal(response, state)
+
+
+def _known_failure_message(code: str) -> str:
+    """Fixed, content-free diagnostic for a closed-set machine code."""
+    if code == "responses_stream_event_not_supported":
+        return (
+            "the endpoint rejected the streamed request with the known gateway "
+            "code 'responses_stream_event_not_supported': this gateway does not "
+            "support streamed Responses events for this request shape. Rerun "
+            "without --stream (buffered mode). Nothing was committed."
+        )
+    return "response failed on the endpoint with an unrecognized code; nothing was committed."
+
+
+def _status_error_message(exc: APIStatusError) -> str:
+    code = exc.code
+    if type(code) is str and code in KNOWN_ENDPOINT_FAILURE_CODES:
+        return _known_failure_message(code)
+    if exc.status_code == 401:
+        return "authentication was rejected by the endpoint (HTTP 401); nothing was committed."
+    if exc.status_code == 403:
+        return "the endpoint denied access (HTTP 403); nothing was committed."
+    return f"HTTP {exc.status_code} from the endpoint; nothing was committed."
+
+
+def send_once(session: Session, resolved: Resolved, user_text: str, stream: bool) -> None:
     headers: dict[str, str] = {}
     for name, value in resolved.extra_headers.items():
         # Load-time validation already rejects conflicts; this keeps the
         # client-owned framing and credentials winning regardless.
         if name.lower() not in CLIENT_OWNED_HEADERS:
             headers[name] = value
-    headers["Content-Type"] = "application/json"
     headers[REPAIR_DETAILS_HEADER] = "1"
-    headers["Authorization"] = f"Bearer {resolved.token}"
-    request = urllib.request.Request(
-        resolved.url, data=payload, headers=headers, method="POST"
+    # One owned SDK client per request: explicit zero retries, finite
+    # timeout, and a redirect-refusing transport (the bearer token and the
+    # conversation must never be resent to a different origin).
+    client = OpenAI(
+        api_key=resolved.token,
+        base_url=resolved.url,
+        max_retries=0,
+        timeout=resolved.timeout,
+        http_client=DefaultHttpxClient(follow_redirects=False, timeout=resolved.timeout),
     )
     state = _TurnState()
-    opener = urllib.request.build_opener(_NoRedirectHandler())
     try:
-        with opener.open(request, timeout=resolved.timeout) as response:
-            content_type = (response.headers.get("Content-Type") or "").split(
-                ";", 1
-            )[0].strip().lower()
-            if content_type == "application/json":
-                try:
-                    value = json.loads(response.read().decode("utf-8"))
-                except (ValueError, UnicodeDecodeError):
-                    _fail(
-                        "endpoint returned non-JSON where JSON was expected; "
-                        "nothing was committed"
-                    )
-                if not isinstance(value, dict):
-                    _fail("endpoint returned non-object JSON; nothing was committed")
-                _validate_terminal(value, state)
-            else:
-                _consume_sse(response, state, resolved.timeout)
+        if stream:
+            stream_obj: Any = client.responses.create(
+                **_request_kwargs(session, user_text, headers, stream=True)
+            )
+            content_type = (stream_obj.response.headers.get("Content-Type") or "")
+            content_type = content_type.split(";", 1)[0].strip().lower()
+            try:
+                if content_type.endswith("json"):
+                    _consume_sdk_json_fallback(stream_obj, state)
+                else:
+                    for event in stream_obj:
+                        _handle_sdk_event(event, state)
+            finally:
+                stream_obj.close()
+        else:
+            response = client.responses.create(
+                **_request_kwargs(session, user_text, headers, stream=False)
+            )
+            if not isinstance(response, Response):
+                # The SDK returns non-object JSON bodies as-is; only a
+                # typed Response object may validate as a terminal.
+                _fail("endpoint returned non-object JSON; nothing was committed")
+            _validate_terminal(response, state)
     except KeyboardInterrupt:
         _close_open(state)
         print("Request interrupted; nothing was committed.", flush=True)
@@ -1003,32 +1056,86 @@ def send_once(session: Session, resolved: Resolved, user_text: str) -> None:
         _close_open(state)
         print(f"error: {exc}", flush=True)
         return
-    except urllib.error.HTTPError as exc:
+    except APITimeoutError:
         _close_open(state)
         print(
-            f"HTTP {exc.code} from the endpoint; nothing was committed.",
+            f"request timed out after {resolved.timeout:g} seconds; "
+            "nothing was committed.",
             flush=True,
         )
-        exc.close()
         return
-    except urllib.error.URLError:
+    except APIStatusError as exc:
+        _close_open(state)
+        print(_status_error_message(exc), flush=True)
+        return
+    except APIResponseValidationError as exc:
+        _close_open(state)
+        if 300 <= exc.status_code < 400:
+            print(f"HTTP {exc.status_code} from the endpoint; nothing was committed.", flush=True)
+        else:
+            print(
+                "endpoint returned data the SDK could not parse; nothing was committed.",
+                flush=True,
+            )
+        return
+    except APIConnectionError:
         _close_open(state)
         print(
             "could not reach the configured endpoint; nothing was committed.",
             flush=True,
         )
         return
-    except OSError:
+    except APIError:
+        # The SDK wraps stream-level endpoint error frames here; the
+        # server text is untrusted, so only a fixed label is printed.
+        _close_open(state)
+        print("the endpoint reported an error; nothing was committed.", flush=True)
+        return
+    except OpenAIError:
+        _close_open(state)
+        print("an unexpected SDK error occurred; nothing was committed.", flush=True)
+        return
+    except json.JSONDecodeError:
+        _close_open(state)
+        if stream:
+            # Malformed data inside an SSE frame is an honest stream
+            # failure, not an ignorable frame.
+            print("malformed stream data; nothing was committed.", flush=True)
+        else:
+            print("endpoint returned malformed data; nothing was committed.", flush=True)
+        return
+    except UnicodeDecodeError:
+        _close_open(state)
+        if stream:
+            print("stream ended with invalid UTF-8; nothing was committed.", flush=True)
+        else:
+            print("endpoint returned malformed data; nothing was committed.", flush=True)
+        return
+    except httpx2.TimeoutException:
+        # Raw transport timeout from a direct owned response read (the
+        # SDK-wrapped iteration path raises APITimeoutError instead).
         _close_open(state)
         print(
-            "connection problem while reading the response; nothing was "
-            "committed.",
+            f"request timed out after {resolved.timeout:g} seconds; "
+            "nothing was committed.",
             flush=True,
         )
         return
+    except httpx2.RequestError:
+        _close_open(state)
+        print(
+            "connection problem while reading the response; nothing was committed.",
+            flush=True,
+        )
+        return
+    finally:
+        client.close()
     _close_open(state)
     if state.failed:
-        print("response failed on the endpoint; nothing was committed.", flush=True)
+        if state.failed_error_code is not None:
+            print(f"error: {_known_failure_message(state.failed_error_code)}", flush=True)
+        else:
+            print("response failed on the endpoint; nothing was committed.", flush=True)
         return
     if state.incomplete:
         print("response incomplete on the endpoint; nothing was committed.", flush=True)
@@ -1042,8 +1149,12 @@ def send_once(session: Session, resolved: Resolved, user_text: str) -> None:
     _finish_turn(state.completed, session, user_text, state)
 
 
-def run_loop(session: Session, resolved: Resolved) -> int:
-    print("repair chat client - /help for commands, /quit to exit")
+def run_loop(session: Session, resolved: Resolved, stream: bool) -> int:
+    mode = "stream (live events)" if stream else "buffered (completed response)"
+    print(
+        f"repair chat client - request mode: {mode} - "
+        "/help for commands, /quit to exit"
+    )
     while True:
         line = _read_line("you> ")
         if line is None:
@@ -1112,7 +1223,7 @@ def run_loop(session: Session, resolved: Resolved) -> int:
         if text.startswith("/"):
             print(HELP_TEXT)
             continue
-        send_once(session, resolved, text)
+        send_once(session, resolved, text, stream)
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -1120,10 +1231,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         prog="repair_chat.py",
         description=(
             "Plain-terminal comparison client: Codex-style TOML profiles and "
-            "model catalogs, streamed server thinking, and the delivered and "
-            "original answers from the language-repair Responses endpoint. "
-            "Session commands: /model and /thinking show numbered menus and "
-            "read the selection from the next line; /help and /quit."
+            "model catalogs, server thinking, and the delivered and original "
+            "answers from the language-repair Responses endpoint via the "
+            "official OpenAI Python SDK.  Buffered completed responses are "
+            "the default; --stream requests live streamed events. Session "
+            "commands: /model and /thinking show numbered menus and read the "
+            "selection from the next line; /help and /quit."
         ),
     )
     parser.add_argument("--profile", help="profile NAME (table or standalone file)")
@@ -1140,6 +1253,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--thinking",
         help="select the reasoning effort for MAIN requests only",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help=(
+            "request streamed Responses events (live reasoning display); "
+            "the default is the buffered completed response"
+        ),
     )
     parser.add_argument(
         "--base-url",
@@ -1207,7 +1328,7 @@ def main(argv: list[str] | None = None) -> int:
     except ClientError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    return run_loop(session, settings.resolved)
+    return run_loop(session, settings.resolved, args.stream)
 
 
 if __name__ == "__main__":
