@@ -3,14 +3,46 @@
 `repair_chat.py` is a runnable plain-terminal client for this proxy: it
 compares the **delivered answer** with the **original answer** when the
 language-repair extension is actually returned, and displays the
-server-provided thinking while the request runs. It loads a Codex-style TOML
-configuration and model catalog (Python 3.12 standard library only — no new
-SDK or package is required):
+server-provided thinking. It loads a Codex-style TOML configuration and model
+catalog, and its actual request/event boundary is the **official OpenAI
+Python SDK** (`openai==3.60.0`, Responses API), pinned in the `client`
+dependency group:
 
 ```bash
-# the profile's configured gateway/proxy base URL is used as-is
+# uv project: install the pinned SDK and run the client in one command
+# (the profile's configured gateway/proxy base URL is used as-is)
+uv run --frozen --group client --python 3.12 python examples/repair_chat.py --profile early-beta
+```
+
+Optionally install the environment first with `uv sync --frozen --group client`
+and then run the same `uv run` command.  No global install is required.
+Outside the uv project, use one interpreter for both install and run:
+
+```bash
+python3.12 -m pip install openai==3.60.0
 python3.12 examples/repair_chat.py --profile early-beta
 ```
+
+The request mode is fixed at startup and announced on the first line:
+
+* **buffered (default)** — one request, one completed `Response`; the
+  server's reasoning and the delivered answer are shown when the response
+  completes.
+* **`--stream`** — the SDK's streamed Responses events; server reasoning
+  deltas are printed as they arrive.  If the server actually answers a
+  stream request with `application/json`, that body is parsed with the
+  SDK's typed `Response` model on the same single request (no retry, no
+  mode fallback).
+
+Against the current gateway, buffered requests complete on both the repaired
+and the unrepaired RTX 3090 routes (reasoning item and delivered answer
+present; the repaired route currently returns no original extension, so the
+client prints the fixed missing-original message).  A streamed text-only
+request is rejected by that gateway with the known code
+`responses_stream_event_not_supported`, which the client reports as a fixed,
+content-free diagnostic.  Buffered completion is not live early-reasoning
+proof: streamed deltas are only displayed when the endpoint actually streams
+them.
 
 `--model qwen3.8-27b-rtx3090-repaired` selects the gateway routing alias (the
 `-repaired` suffix is a gateway alias, not an upstream model ID) through the
@@ -36,6 +68,7 @@ Useful options (`--help` lists all of them):
 | `--models FILE` | explicit model catalog JSON |
 | `--model SLUG` | select the model |
 | `--thinking LEVEL` | initial reasoning effort for MAIN requests |
+| `--stream` | request streamed Responses events (live reasoning display); default is the buffered completed response |
 | `--base-url URL` | override the API base (for example a local proxy) |
 | `--timeout SECONDS` | finite request timeout, default 900 |
 
@@ -163,7 +196,7 @@ A session with thinking and a repaired answer (illustrative output, not a
 real model transcript):
 
 ```text
-repair chat client - /help for commands, /quit to exit
+repair chat client - request mode: buffered (completed response) - /help for commands, /quit to exit
 you> Napiši kratek stavek o sončnem dnevu.
 Thinking
 Kratek stavek o sončnem dnevu.
@@ -189,8 +222,9 @@ Original response was not provided.
 
 ## What it sends, and honest limits
 
-- Each turn is one `POST /v1/responses` with `store: false`, `stream: true`,
-  the exact selected model, `reasoning.effort`, the
+- Each turn is one `POST /v1/responses` with `store: false`, `stream: false`
+  (buffered default) or `stream: true` (with `--stream`), the exact selected
+  model, `reasoning.effort`, the
   `X-LLM-Language-Repair-Details: 1` header, and an in-memory text-only
   history containing only successful user prompts and delivered assistant
   answers (reasoning, original text, extension metadata and failed or partial
@@ -221,6 +255,9 @@ Original response was not provided.
 - It never starts an AI process, reads `auth.json` or performs OAuth, sends
   tools or `previous_response_id`, retries, or keeps an on-disk transcript; it
   supports the Responses wire API only, and it is not a full Codex client.
+- Transport is the official SDK with `max_retries=0`, a finite timeout per
+  request, deterministic cleanup, and a redirect-refusing transport; the
+  hand-written urllib/SSE transport is gone rather than kept as a fallback.
 
 Contract tests exercising the real script over an owned loopback HTTP server
 live in `tests/contract/test_repair_chat.py` (synthetic homes, catalogs and

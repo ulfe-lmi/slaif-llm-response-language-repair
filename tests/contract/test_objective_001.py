@@ -98,7 +98,13 @@ def test_project_metadata_and_dependency_boundaries() -> None:
 
     groups = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["dependency-groups"]
     assert groups == {
-        "dev": ["mypy>=2.3.1,<3", "pytest>=9.1.1,<10", "ruff>=0.16.6,<0.17"]
+        "client": ["openai==3.60.0"],
+        "dev": [
+            "mypy>=2.3.1,<3",
+            "pytest>=9.1.1,<10",
+            "ruff>=0.16.6,<0.17",
+            "openai==3.60.0",
+        ],
     }
 
 
